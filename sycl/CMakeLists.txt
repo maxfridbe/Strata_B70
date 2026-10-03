@@ -204,6 +204,10 @@ if(STRATA_SYCL_PARITY)
   add_executable(native_grouped_parity ${_src})
   target_link_libraries(native_grouped_parity PRIVATE strata_kernels)
   add_test(NAME native_grouped_parity COMMAND native_grouped_parity)
+  strata_resolve(_src src/kernels/native_router_parity.cpp)
+  add_executable(native_router_parity ${_src})
+  target_link_libraries(native_router_parity PRIVATE strata_kernels)
+  add_test(NAME native_router_parity COMMAND native_router_parity)
   # (upstream PR #413's gdn_rec_parity is an SM-holding NVIDIA bench - PTX timers, __nanosleep - not built here; the
   # key-head kernel is checked through the engine: output hashes with STRATA_GDN_KEYHEAD=1 and without)
   # the conversation snapshots (#216) against the engine, as upstream's STRATA_BUILD_CONVERSATION_TESTS

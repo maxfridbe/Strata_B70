@@ -82,7 +82,6 @@ __dpct_inline__ void route(const float *__restrict__ logits,
     float values[NE / 32];
 #pragma unroll
     for (int i = 0; i < NE / 32; ++i) values[i] = logits[lane + i * 32];
-    item_ct1.barrier(sycl::access::fence_space::local_space);
     float maximum = -INFINITY;
 #pragma unroll
     for (int i = 0; i < NE / 32; ++i) maximum = sycl::max(maximum, values[i]);
