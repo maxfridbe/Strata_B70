@@ -700,6 +700,24 @@ produced zeros from the first token before). The CPU computes about 4-5 experts 
 | GPU-only (`STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1`) | 7.14 |
 | host plan, `--adapt-every 0` (64 tokens) | 5.65, 5.97 (and one run that produced wrong tokens, see below) |
 
+**Keeping the experts in use in VRAM.** The static profile (`data/expert-profile-coder.bin`) puts 4,836 experts in VRAM and with
+swaps off the CPU computes about 10 of the 16 experts a two-token window routes per layer (a VRAM hit rate of about a third). The
+adaptive swaps move the experts the prompt actually routes to into VRAM and bring that down to about 2 (a hit rate of about 87%).
+Their settings were swept on the host-plan path, 256 tokens, `--spec 2 --suffix-draft 0`:
+
+| setting | CPU experts per layer | swapped | decode |
+|---|---|---|---|
+| default (`--adapt-every 4 --adapt-swaps 96 --adapt-decay 0.7`, 4,836 slots) | 2.1 | 2,621 | 8.69 tok/s |
+| `--adapt-swaps 192` | 2.6 | 4,340 | 8.18 |
+| `--adapt-decay 0.92` | 3.3 | 4,474 | 8.13 |
+| `STRATA_ADAPT_TUNED=1` (every 2, 192 swaps, decay 0.92) | 3.2 | 8,859 | 8.34 |
+| `--vram-reserve-mib 512` (5,102 slots) | 3.8 | 5,630 | 7.86 |
+| tuned + 5,102 slots | 2.1 | 5,198 | 8.27 |
+
+Nothing beat the default, and the differences are within run-to-run noise (about 0.4 tok/s). More slots or more aggressive swapping
+does not help because a round takes about 100 ms of GPU time whether the CPU computes 2 experts per layer or 4: the limit is now
+the GPU's kernels, not where the experts live.
+
 **Adaptive swaps (fixed).** The default `--adapt-every 4` used to zero the output after the first swap. The swap itself was
 sound: the device residency table matched the host's and the swapped-in slots were byte-identical to the GGUF. An evicted expert
 had never been mirrored in pinned host memory, so the GPU could not read it and the device plan waited for the host, whose flags
