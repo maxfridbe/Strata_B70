@@ -1367,7 +1367,7 @@ bool session_run_token(const ModelGeometry &g, int64_t pos, int32_t pos_base,
                 // A slow ring: flush the submission queue once more, and notice a fault or a finished graph.
                 last_flush = now;
                 ++tg.flushes;
-                const dpct::err0 q = DPCT_CHECK_ERROR((cs->ext_oneapi_empty()));
+                const dpct::err0 q = cs->ext_oneapi_empty() ? 0 : 1;   // see verify.cpp: the queue's answer, not the check macro's 0
                 if (q != 1 && *seq < want) {
                     err = "session_run_token: layer " + std::to_string(l) +
                           " never rang (" +

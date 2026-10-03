@@ -1255,8 +1255,9 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
-                const dpct::err0 q =
-                    DPCT_CHECK_ERROR(((cs_)->ext_oneapi_empty()));
+                // cudaStreamQuery's "not ready" is 1 here; DPCT_CHECK_ERROR drops the queue's answer and always gave 0,
+                // so a layer slower than one flush interval was reported as "graph finished"
+                const dpct::err0 q = cs_->ext_oneapi_empty() ? 0 : 1;
                 if (q != 1 && *seq < want) {
                     err = "verify: layer " + std::to_string(l) +
                           " never rang (" +
