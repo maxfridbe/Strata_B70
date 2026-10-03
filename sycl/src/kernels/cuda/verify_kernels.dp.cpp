@@ -6,6 +6,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/sycl_wait_timeouts.hpp"
 #include "strata/sycl_doorbell.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/resident_plan_mirror.hpp"
@@ -910,8 +911,10 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 
 namespace {
 __dpct_inline__ void wait_flag_ge_kernel(const volatile uint32_t *flag,
-                                         uint32_t value) {
-    for (uint32_t spin = 0; spin < strata::kSpinMax && strata::sys_load(flag) < value; ++spin) strata_spin_pause();
+                                         uint32_t value, uint32_t *timeouts, uint32_t spin_max) {
+    uint32_t spin = 0;
+    for (; spin < spin_max && strata::sys_load(flag) < value; ++spin) strata_spin_pause();
+    if (spin == spin_max && strata::sys_load(flag) < value) strata::sys_atomic_u32(*timeouts).fetch_add(1u);
     /*
     DPCT1078: Consider replacing memory_order::acq_rel with
     memory_order::seq_cst for correctness if strong memory order restrictions
@@ -1069,9 +1072,11 @@ __dpct_inline__ void resident_plan_kernel(
 }
 __dpct_inline__ void wait_flag_ge_or_kernel(const volatile uint32_t *flag,
                                             uint32_t value,
-                                            const volatile uint32_t *skip) {
+                                            const volatile uint32_t *skip, uint32_t *timeouts, uint32_t spin_max) {
     if (strata::sys_load(skip) == value) return;
-    for (uint32_t spin = 0; spin < strata::kSpinMax && strata::sys_load(flag) < value; ++spin) strata_spin_pause();
+    uint32_t spin = 0;
+    for (; spin < spin_max && strata::sys_load(flag) < value; ++spin) strata_spin_pause();
+    if (spin == spin_max && strata::sys_load(flag) < value) strata::sys_atomic_u32(*timeouts).fetch_add(1u);
     /*
     DPCT1078: Consider replacing memory_order::acq_rel with
     memory_order::seq_cst for correctness if strong memory order restrictions
@@ -1141,6 +1146,8 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     check("resident_plan");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
+    uint32_t* const timeouts = strata::wait_timeouts_counter(*strata::q_of(stream)) + strata::wait_kind(flag);
+    const uint32_t spin_max = strata::spin_max();
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
@@ -1150,7 +1157,7 @@ void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip,
                 dpct_kernel_name<class wait_flag_ge_or_kernel_2b2de3>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1), sycl::range(1, 1, 1)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    wait_flag_ge_or_kernel(flag, value, skip);
+                    wait_flag_ge_or_kernel(flag, value, skip, timeouts, spin_max);
                 });
     }
     check("wait_flag_ge_or");
@@ -1198,6 +1205,8 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
+    uint32_t* const timeouts = strata::wait_timeouts_counter(*strata::q_of(stream)) + strata::wait_kind(flag);
+    const uint32_t spin_max = strata::spin_max();
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
@@ -1206,7 +1215,7 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
             ->parallel_for<dpct_kernel_name<class wait_flag_ge_kernel_d7debf>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1), sycl::range(1, 1, 1)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    wait_flag_ge_kernel(flag, value);
+                    wait_flag_ge_kernel(flag, value, timeouts, spin_max);
                 });
     }
     check("wait_flag_ge");

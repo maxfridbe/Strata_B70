@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include <sycl/sycl.hpp>
+#include "strata/sycl_wait_timeouts.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/core/verify.hpp"
 #if defined(_WIN32)
@@ -287,6 +288,11 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
               mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+    if (ok) {   // name the flags the device waits on, so a wait that gives up says which one
+        strata::wait_register(1, m_flagA_, "flag A (the plan)");
+        strata::wait_register(2, m_flagB_, "flag B (the PCIe copies)");
+        strata::wait_register(3, m_flag_, "flag M (the CPU's results)");
+    }
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
     // the GPU plan: counts(4) | start(cap+1) | dst(cap) | tok(cap) | pad | ptr(cap u64) | ptr2(cap u64) | start2(cap+1)
     {
@@ -1312,6 +1318,22 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
     // spin kernel outlives the process.  The wait itself stays a blocking sync (a polling wait cost decode upstream).
     const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
+    // a device wait that gave up (kSpinMax) let the window go on without what the host was to write: refuse the window
+    // rather than return its output (STRATA_WAIT_TIMEOUT=warn only reports it)
+    uint32_t gave_up_by[strata::kWaitKinds];
+    if (const uint32_t gave_up = strata::wait_timeouts_take(gave_up_by); gave_up != 0) {
+        static const bool warn_only = [] { const char* v = std::getenv("STRATA_WAIT_TIMEOUT"); return v != nullptr && std::string(v) == "warn"; }();
+        std::fprintf(stderr, "strata verify: %u device wait(s) gave up after %u polls before the host's flag arrived (window T=%d at "
+                             "position %lld); the window's output is not valid%s\n",
+                     (unsigned) gave_up, (unsigned) strata::spin_max(), T, (long long) pos0, warn_only ? " (STRATA_WAIT_TIMEOUT=warn: continuing)" : "");
+        for (int k = 0; k < strata::kWaitKinds; ++k)
+            if (gave_up_by[k]) std::fprintf(stderr, "  waits on %s gave up: %u\n", strata::g_wait_name[k], (unsigned) gave_up_by[k]);
+        diag(stderr);   // the host's own view: how far it got, how many times it saw the GPU ring, which flags it raised
+        if (!warn_only) {
+            err = "verify: " + std::to_string(gave_up) + " device wait(s) gave up before the host's flag arrived";
+            return false;
+        }
+    }
     if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {
         const Clock::time_point t_done = Clock::now();
         std::fprintf(stderr, "verify dbg: T=%d window: since previous window %.1f ms, staging %.1f ms, gpu %.1f ms\n", T,
