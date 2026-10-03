@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include <sycl/sycl.hpp>
+#include "strata/sycl_host_mem.hpp"
 #include "strata/sycl_wait_timeouts.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/core/verify.hpp"
@@ -71,15 +72,15 @@ struct Bump {
     }
 };
 
-bool mapped(size_t bytes, void **h, void **d) try {
+bool mapped(size_t bytes, void **h, void **d, strata::HostUse use = strata::HostUse::kPlain) try {
     /*
     DPCT1048: The original value cudaHostAllocMapped is not meaningful in the
     migrated code and was removed or replaced with 0. You may need to check the
     migrated code.
     */
-    if (DPCT_CHECK_ERROR(*h = (void *)sycl::malloc_host(
-                             bytes, dpct::get_in_order_queue())) !=
-        0) return false;
+    // allocated through Level Zero directly: a kernel polling sycl::malloc_host memory does not see the host's later stores
+    *h = strata::host_alloc_coherent(bytes, dpct::get_in_order_queue(), use);
+    if (*h == nullptr) return false;
     std::memset(*h, 0, bytes);
     return DPCT_CHECK_ERROR(*d = (void *)*h) == 0;
 }
@@ -203,7 +204,7 @@ Verifier::~Verifier() try {
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_};
     for (void* h : hosts)
-        if (h) sycl::free(h, dpct::get_in_order_queue());
+        if (h) strata::host_free_coherent(h, dpct::get_in_order_queue());
 } catch (...) {
 }
 
@@ -274,6 +275,10 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
 
     // ---- mapped staging
+    // The flags need memory a polling kernel sees the host write to only when something waits on the host. With
+    // STRATA_VERIFY_NO_HOST nothing does, and the uncached flags then cost 42 ms per window on the A770 (measured), so
+    // that mode keeps the plain allocation.
+    const strata::HostUse flag_use = std::getenv("STRATA_VERIFY_NO_HOST") != nullptr ? strata::HostUse::kPlain : strata::HostUse::kControl;
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
               mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
@@ -284,9 +289,9 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
               mapped(T * K * 4, (void**) &h_w_, (void**) &m_w_) &&
               mapped(64, (void**) &h_seq_, (void**) &m_seq_) &&
-              mapped(64, (void**) &h_flag_, (void**) &m_flag_) &&
-              mapped(64, (void**) &h_flagA_, (void**) &m_flagA_) &&
-              mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
+              mapped(64, (void**) &h_flag_, (void**) &m_flag_, flag_use) &&
+              mapped(64, (void**) &h_flagA_, (void**) &m_flagA_, flag_use) &&
+              mapped(64, (void**) &h_flagB_, (void**) &m_flagB_, flag_use) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (ok) {   // name the flags the device waits on, so a wait that gives up says which one
         strata::wait_register(1, m_flagA_, "flag A (the plan)");
