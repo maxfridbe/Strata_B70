@@ -629,10 +629,13 @@ cmake -S sycl -B build-sycl-aot -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMP
       -DSTRATA_SYCL_NO_XMX=ON -DSTRATA_SYCL_LARGE_BUFFERS=ON
 IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1 AOT=dg2-g10 sycl/tools/build.sh strata   # full build ~25-40 min
 
-UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 ZES_ENABLE_SYSMAN=1 STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1 \
+UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 ZES_ENABLE_SYSMAN=1 \
 build-sycl-aot/strata --pack <iq pack> --native <shard1> --ple-gguf <shard2> --expert-profile data/expert-profile-coder.bin \
     --stream-experts --expert-cache auto --vram-reserve-mib 1024 --prefill auto --spec 2 --suffix-draft 0 ...
 ```
+
+This is the host-plan path: the CPU computes part of the experts that miss VRAM beside the GPU. For a GPU-only run add
+`STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1` (slower here: 7.1 tok/s, see below).
 
 **What differs from the B70, and what each difference needed.**
 
@@ -645,11 +648,12 @@ build-sycl-aot/strata --pack <iq pack> --native <shard1> --ple-gguf <shard2> --e
 | IGC addresses a buffer with 32-bit offsets unless told the buffer may exceed 4 GiB | a resident expert 5.96 GiB into the cache dequantised to NaN while the same expert in a small buffer was fine; the prompt path then poisoned the residual from layer 1 on and the model produced only token 0 | `-DSTRATA_SYCL_LARGE_BUFFERS=ON` adds `-ze-opt-greater-than-4GB-buffer-required` to the AOT options |
 | a work-group barrier after some work-items have returned never completes | the native router (`route<NE>`) hung the first decode window, GPU busy, until the xe driver reset the compute engine | the barrier is removed (it protected nothing); `native_router_parity` is new |
 | `DPCT_CHECK_ERROR(queue.ext_oneapi_empty())` returns 0, not the queue's answer | "layer N never rang (graph finished)" after 2 ms on any slow layer | the queue's answer is used |
+| a kernel polling `sycl::malloc_host` memory never sees a host store made after it started | the GPU's bounded wait for each flag the host raises gave up, on every layer, although the host had raised all of them; the window went on with garbage | the flag words are allocated through Level Zero with `ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED` (`sycl_host_mem.hpp`); a wait that still gives up now stops the engine and names the flag |
 
 The A770 has one compute queue and one copy queue (the B70 has more), 512 EUs, 64 KiB of local memory per work-group.
 
-**Speed.** Decode is 7.7 tok/s at best (llama.cpp's SYCL backend, same GGUF, same card: 9.4-9.8), prompt reading 11-23 tok/s on a
-19-token prompt. 4,836 of the 12,288 experts fit in VRAM; the other 7,452 are mirrored in pinned host memory and read by the
+**Speed.** Decode is 8.0-8.6 tok/s on the host-plan path (llama.cpp's SYCL backend, same GGUF, same card: 9.4-9.8), prompt reading
+11-23 tok/s on a 19-token prompt. 4,836 of the 12,288 experts fit in VRAM; the other 7,452 are mirrored in pinned host memory and read by the
 GPU over PCIe.
 
 | setting | decode |
@@ -660,9 +664,12 @@ GPU over PCIe.
 | `--vram-reserve-mib 512` (5,102 slots) | 7.33 (against 7.11 at 1,024) |
 | `--expert-cache-per-layer` | 6.34 |
 | host handshake path, `--adapt-every 0` (CPU pool takes misses) | 7.06 |
-| host handshake path with adaptive swaps (default), `--spec 2 --suffix-draft 0`, 128 tokens | 9.80, 9.77, 6.73 (three identical runs) |
-| the same, 256 tokens / `STRATA_ADAPT_TUNED=1` / `--adapt-every 1` / `--spec 3` with drafts | 7.66 / 7.02 / 6.53 / 7.63 |
+| (measured before the handshake fix below, the GPU's waits then gave up) host path with adaptive swaps, 128 tokens | 9.80, 9.77, 6.73 (three identical runs) |
+| (before the fix) the same, 256 tokens / `STRATA_ADAPT_TUNED=1` / `--adapt-every 1` / `--spec 3` with drafts | 7.66 / 7.02 / 6.53 / 7.63 |
 | GPU-only (`STRATA_VERIFY_NO_HOST=1`), two runs | 7.14, 7.14 |
+
+The three "before the fix" rows were fast when they happened to work because the device plan then never had to wait on the host.
+The measurements after the fix are in the second table below.
 
 A round costs about 140 ms whether it carries one token or four, so the decode is not bound by compute. In eager mode with
 `STRATA_VERIFY_PROFILE=1` the 36 GDN layers spend 47 ms in the expert stage (VRAM hits and mirror reads), 17 ms in the first
@@ -670,25 +677,42 @@ hyper-connection read and 14 ms in the second read plus the router, against 0.27
 reads host memory at 9.4 GB/s from a kernel and 9.4 GB/s by DMA on this host (a 2 GiB copy), so PCIe 3.0 is a ceiling but
 not the whole cost.
 
-The host handshake path with adaptive swaps is bimodal: the same command gave 9.8 tok/s twice and 6.7 once, and 6.5-7.7 in the
-longer and tuned runs. The fast runs had the CPU computing 2.8 experts per layer, the slow ones 4-4.7 (the CPU pool itself runs
-at the same 30 GB/s in both; the PCIe probe is identical, 4.9 GB/s, every time), so the difference is which experts the
-asynchronous swaps leave in VRAM, and that varies from run to run. The steady GPU-only path is 7.1-7.7.
+**The host-to-GPU handshake (fixed).** The engine's design is that the host raises flags (the plan, the copies, the CPU's
+results) that a kernel on the GPU polls. On the A770 a polling kernel never saw a host store to `sycl::malloc_host` memory: 60
+million system-scope atomic loads (and every other load variant) saw nothing, and a wait gave up after its bound however long
+the bound was (checked at 100x: 2 million polls, about two seconds). Every layer then paid the whole bound and went on with
+the data the host was supposed to write still missing: garbage, which the recurrent GDN state keeps for good. Memory from
+`zeMemAllocHost` with the uncached or write-combined flag was seen within microseconds in every trial; the same call with no
+flags was not reliable. The flag words are now allocated that way. Everything else keeps the adapter's allocation: making the plan
+and result rows uncached cost 42 ms per window, and with `STRATA_VERIFY_NO_HOST` (nothing waits on the host) even the three flag
+words did, so that mode keeps the plain allocation. A wait that still gives up now stops the engine with the flag's name
+(`STRATA_WAIT_TIMEOUT=warn` only reports; `STRATA_SPIN_MAX` sets the bound, default 20,000 polls, about 22 ms here; do not set it
+to hundreds of millions: a spin that long can trip the xe driver's hang detection).
 
-**Adaptive swaps (fixed).** The default `--adapt-every 4` used to zero the output after the first swap (correct for four
-tokens, token 0 after). The swap itself was sound: the device residency table matched the host's and the swapped-in slots were
-byte-identical to the GGUF. The cause was that an evicted expert had never been mirrored in pinned host memory, so the GPU could
-not read it itself, the device plan waited for the host, and the device-to-host handshake does not hold on this card: the
-GPU's bounded wait gave up and the window went on with garbage that the recurrent state keeps for good. With swaps on, the
-resident experts are now mirrored too (after the real misses, within the RAM cap; `STRATA_MIRROR_ALL=0` turns it off), about
-9 GiB more pinned memory on the 16 GB card. Separately, `GgufExpertSource::blob()` published a ring slot before its read had
-finished; that race is fixed too but was not what caused this.
+With the handshake working, the host-plan path is the fast one: 8.0-8.6 tok/s over 128 tokens, five runs, correct output (it
+produced zeros from the first token before). The CPU computes about 4-5 experts per layer beside the GPU.
+
+| setting (128 tokens, `--spec 2 --suffix-draft 0`) | decode |
+|---|---|
+| host plan, adaptive swaps (the default), resident experts mirrored too | 8.05, 8.64, 8.26, 7.82, 8.14, 8.03, 8.36 |
+| the same with `STRATA_MIRROR_ALL=0` | 7.31, 7.45 |
+| device plan + host handshake, `STRATA_MIRROR_ALL=0` | 7.28 |
+| GPU-only (`STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1`) | 7.14 |
+| host plan, `--adapt-every 0` (64 tokens) | 5.65, 5.97 (and one run that produced wrong tokens, see below) |
+
+**Adaptive swaps (fixed).** The default `--adapt-every 4` used to zero the output after the first swap. The swap itself was
+sound: the device residency table matched the host's and the swapped-in slots were byte-identical to the GGUF. An evicted expert
+had never been mirrored in pinned host memory, so the GPU could not read it and the device plan waited for the host, whose flags
+the GPU could not see (above). Now the waits work, and mirroring the resident experts too (after the real misses, within the RAM
+cap; `STRATA_MIRROR_ALL=0` turns it off) is a speed matter: the swap costs 0.3 ms per round with it and 6.6 without, and the
+decode is 8.0-8.6 against 7.3-7.5. It costs about 9 GiB more pinned memory on the 16 GB card. Separately,
+`GgufExpertSource::blob()` published a ring slot before its read had finished; that race is fixed too but was not the cause.
 
 **Open.**
-- On the A770 any expert the GPU cannot reach by itself (neither in VRAM nor mirrored) makes the device plan wait for a host
-  flag that the host cannot reliably signal, and the engine then continues with garbage instead of stopping. Anything that
-  creates such an expert, or `--stream-experts` with no mirror, hits it.
-- Without `STRATA_VERIFY_DEVICE_PLAN=1` the host-plan path produced zeros from the first token (not investigated).
+- Host plan with `--adapt-every 0` produced wrong tokens once (from the second token, the CPU computing 10 experts per layer) in
+  three runs; two repeats were correct. Not explained.
+- The three flag words in uncached memory cost 42 ms per window on the GPU-only path, which never reads them. Not explained;
+  that mode keeps the plain allocation.
 - Per-kernel timestamps read zeros (`%globaltimer`), so the profile above is host-timed and per stage.
 - The prompt path needs `iq_dequant_f16` and the oneMKL GEMMs; `conversation_snapshot_test` segfaults (not investigated).
 - `kv_hybrid_parity` and `qsa_prompt_attn_parity` fail with `STRATA_SYCL_NO_XMX=ON` because they require the XMX kernel.
