@@ -615,3 +615,61 @@ test an SM-holding NVIDIA bench (not built). Outputs identical to 0.1.33 (Coder 
 | decode | 23-25 tok/s; GPU 92% busy at 165 W, CPU idle |
 | prefill | 149 tok/s on a 2,701-token prompt; 424 tok/s on a 104,798-token prompt at 131k context |
 | quality | correct code on every test; matches the NVIDIA path token for token in spirit, not measured |
+
+## Arc A770 (DG2, 16 GB), 2026-10-03
+
+The SYCL port builds and generates correct text on an Arc A770 (Xe-HPG, 16 GB, xe driver), not only the Arc Pro B70 it was
+written for. Measured on a Xeon E5 v4 host (22 cores, 121 GB RAM, PCIe 3.0 x16), kernel 7.0 with the xe driver, the Coder
+IQ1_M, a 19-token prompt, 128 greedy tokens, 8,192 context. The output matches the sample in "The engine end to end".
+
+**How to build and run it.**
+
+```
+cmake -S sycl -B build-sycl-aot -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DSTRATA_SYCL_AOT=dg2-g10 \
+      -DSTRATA_SYCL_NO_XMX=ON -DSTRATA_SYCL_LARGE_BUFFERS=ON
+IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1 AOT=dg2-g10 sycl/tools/build.sh strata   # full build ~25-40 min
+
+UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 ZES_ENABLE_SYSMAN=1 STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1 \
+build-sycl-aot/strata --pack <iq pack> --native <shard1> --ple-gguf <shard2> --expert-profile data/expert-profile-coder.bin \
+    --stream-experts --expert-cache auto --vram-reserve-mib 1024 --prefill auto --spec 2 --suffix-draft 0 ...
+```
+
+**What differs from the B70, and what each difference needed.**
+
+| the A770 | what went wrong | the change |
+|---|---|---|
+| no fp64 (the engine accumulates some norms in `double` on purpose) | the build failed with "Double type is not supported" | build with IGC's fp64 emulation (`IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1`) |
+| IGC (dg2) crashes on `joint_matrix` | `ocloc` died with a floating point exception on `xmx_gemm_iq` and `qsa_prompt_attn_xmx` | `-DSTRATA_SYCL_NO_XMX=ON` (both are opt-in and slower than the default paths) |
+| the oneAPI Level Zero adapter does not answer free-memory queries on xe | `--expert-cache auto` saw 0 GiB free and made 0 slots | `dpct::get_memory_info` asks Level Zero Sysman directly when the SYCL aspect is missing |
+| one allocation is capped at 4,095 MiB, host and device | the 9 GiB expert cache and the 14 GiB pinned mirror failed to allocate | `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1` for the device; the mirror in chunks of at most 3 GiB |
+| IGC addresses a buffer with 32-bit offsets unless told the buffer may exceed 4 GiB | a resident expert 5.96 GiB into the cache dequantised to NaN while the same expert in a small buffer was fine; the prompt path then poisoned the residual from layer 1 on and the model produced only token 0 | `-DSTRATA_SYCL_LARGE_BUFFERS=ON` adds `-ze-opt-greater-than-4GB-buffer-required` to the AOT options |
+| a work-group barrier after some work-items have returned never completes | the native router (`route<NE>`) hung the first decode window, GPU busy, until the xe driver reset the compute engine | the barrier is removed (it protected nothing); `native_router_parity` is new |
+| `DPCT_CHECK_ERROR(queue.ext_oneapi_empty())` returns 0, not the queue's answer | "layer N never rang (graph finished)" after 2 ms on any slow layer | the queue's answer is used |
+
+The A770 has one compute queue and one copy queue (the B70 has more), 512 EUs, 64 KiB of local memory per work-group.
+
+**Speed.** Decode is 7.7 tok/s at best (llama.cpp's SYCL backend, same GGUF, same card: 9.4-9.8), prompt reading 11-23 tok/s on a
+19-token prompt. 4,836 of the 12,288 experts fit in VRAM; the other 7,452 are mirrored in pinned host memory and read by the
+GPU over PCIe.
+
+| setting | decode |
+|---|---|
+| `--spec 4` (default drafts, 8% accepted) | 5.88 tok/s |
+| `--spec 2` | 7.67 |
+| `--spec 2 --suffix-draft 0` (no drafts) | 7.11 |
+| `--vram-reserve-mib 512` (5,102 slots) | 7.33 (against 7.11 at 1,024) |
+| `--expert-cache-per-layer` | 6.34 |
+| host handshake path, `--adapt-every 0` (CPU pool takes misses) | 7.06 |
+
+A round costs about 140 ms whether it carries one token or four, so the decode is not bound by compute. In eager mode with
+`STRATA_VERIFY_PROFILE=1` the 36 GDN layers spend 47 ms in the expert stage (VRAM hits and mirror reads), 17 ms in the first
+hyper-connection read and 14 ms in the second read plus the router, against 0.27 ms per layer all-in on the B70. The card
+reads host memory at 9.4 GB/s from a kernel and 9.4 GB/s by DMA on this host (a 2 GiB copy), so PCIe 3.0 is a ceiling but
+not the whole cost.
+
+**Open.**
+- The adaptive tier swap (default `--adapt-every 4`) corrupts the output on the host handshake path: correct for the first four
+  tokens, then zeros after the first swap of 496 experts. `--adapt-every 0` is correct.
+- Per-kernel timestamps read zeros (`%globaltimer`), so the profile above is host-timed and per stage.
+- The prompt path needs `iq_dequant_f16` and the oneMKL GEMMs; `conversation_snapshot_test` segfaults (not investigated).
+- `kv_hybrid_parity` and `qsa_prompt_attn_parity` fail with `STRATA_SYCL_NO_XMX=ON` because they require the XMX kernel.
