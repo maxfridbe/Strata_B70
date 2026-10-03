@@ -660,6 +660,9 @@ GPU over PCIe.
 | `--vram-reserve-mib 512` (5,102 slots) | 7.33 (against 7.11 at 1,024) |
 | `--expert-cache-per-layer` | 6.34 |
 | host handshake path, `--adapt-every 0` (CPU pool takes misses) | 7.06 |
+| host handshake path with adaptive swaps (default), `--spec 2 --suffix-draft 0`, 128 tokens | 9.80, 9.77, 6.73 (three identical runs) |
+| the same, 256 tokens / `STRATA_ADAPT_TUNED=1` / `--adapt-every 1` / `--spec 3` with drafts | 7.66 / 7.02 / 6.53 / 7.63 |
+| GPU-only (`STRATA_VERIFY_NO_HOST=1`), two runs | 7.14, 7.14 |
 
 A round costs about 140 ms whether it carries one token or four, so the decode is not bound by compute. In eager mode with
 `STRATA_VERIFY_PROFILE=1` the 36 GDN layers spend 47 ms in the expert stage (VRAM hits and mirror reads), 17 ms in the first
@@ -667,9 +670,25 @@ hyper-connection read and 14 ms in the second read plus the router, against 0.27
 reads host memory at 9.4 GB/s from a kernel and 9.4 GB/s by DMA on this host (a 2 GiB copy), so PCIe 3.0 is a ceiling but
 not the whole cost.
 
+The host handshake path with adaptive swaps is bimodal: the same command gave 9.8 tok/s twice and 6.7 once, and 6.5-7.7 in the
+longer and tuned runs. The fast runs had the CPU computing 2.8 experts per layer, the slow ones 4-4.7 (the CPU pool itself runs
+at the same 30 GB/s in both; the PCIe probe is identical, 4.9 GB/s, every time), so the difference is which experts the
+asynchronous swaps leave in VRAM, and that varies from run to run. The steady GPU-only path is 7.1-7.7.
+
+**Adaptive swaps (fixed).** The default `--adapt-every 4` used to zero the output after the first swap (correct for four
+tokens, token 0 after). The swap itself was sound: the device residency table matched the host's and the swapped-in slots were
+byte-identical to the GGUF. The cause was that an evicted expert had never been mirrored in pinned host memory, so the GPU could
+not read it itself, the device plan waited for the host, and the device-to-host handshake does not hold on this card: the
+GPU's bounded wait gave up and the window went on with garbage that the recurrent state keeps for good. With swaps on, the
+resident experts are now mirrored too (after the real misses, within the RAM cap; `STRATA_MIRROR_ALL=0` turns it off), about
+9 GiB more pinned memory on the 16 GB card. Separately, `GgufExpertSource::blob()` published a ring slot before its read had
+finished; that race is fixed too but was not what caused this.
+
 **Open.**
-- The adaptive tier swap (default `--adapt-every 4`) corrupts the output on the host handshake path: correct for the first four
-  tokens, then zeros after the first swap of 496 experts. `--adapt-every 0` is correct.
+- On the A770 any expert the GPU cannot reach by itself (neither in VRAM nor mirrored) makes the device plan wait for a host
+  flag that the host cannot reliably signal, and the engine then continues with garbage instead of stopping. Anything that
+  creates such an expert, or `--stream-experts` with no mirror, hits it.
+- Without `STRATA_VERIFY_DEVICE_PLAN=1` the host-plan path produced zeros from the first token (not investigated).
 - Per-kernel timestamps read zeros (`%globaltimer`), so the profile above is host-timed and per stage.
 - The prompt path needs `iq_dequant_f16` and the oneMKL GEMMs; `conversation_snapshot_test` segfaults (not investigated).
 - `kv_hybrid_parity` and `qsa_prompt_attn_parity` fail with `STRATA_SYCL_NO_XMX=ON` because they require the XMX kernel.
