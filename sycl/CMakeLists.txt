@@ -140,7 +140,7 @@ endif()
 strata_resolve(_core src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp
                      src/core/weights.cpp src/core/layout.cpp)
 add_library(strata_core STATIC ${_core})
-target_link_libraries(strata_core PUBLIC strata_includes)
+target_link_libraries(strata_core PUBLIC strata_includes ze_loader)
 
 set(_kernel_cu dequant_s2 s2_gemv s_gemv s2_gemv_quads s2_gemv_fast router_top10 quantize_act rope sampler s2_gemv_q8
     s2_expert_grouped shared_expert gr gdn qsa elementwise bf16_gemv native_mmvq native_bf16 native_gr_norm native_moe
