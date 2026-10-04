@@ -722,6 +722,12 @@ cap; `STRATA_MIRROR_ALL=0` turns it off) is a speed matter: the swap costs 0.3 m
 decode is 8.0-8.6 against 7.3-7.5. It costs about 9 GiB more pinned memory on the 16 GB card. Separately,
 `GgufExpertSource::blob()` published a ring slot before its read had finished; that race is fixed too but was not the cause.
 
+**Re-checked on engine 0.1.38-sycl (2026-10-04),** after merging upstream's b70 up to 25277f9 into this branch: GPU-only decode 10.37 and
+10.36 tok/s (128 tokens, the same tokens as before), host plan 8.66; the kernel parity results are unchanged (the same tests
+pass and the same five do not); `STRATA_GR_DOWN_MAX4=1` makes no difference here. `xmx_int8_bench`, upstream's int8 DPAS
+prototype, makes IGC for dg2 die with a floating point exception, like the fp16 `joint_matrix` kernels, so it is built only
+without `STRATA_SYCL_NO_XMX`; upstream measured it 0.38-0.98x of dequant + oneMKL on the B70 and not worth an engine port.
+
 **Open.**
 - Host plan with `--adapt-every 0` produced wrong tokens once (from the second token, the CPU computing 10 experts per layer) in
   three runs; two repeats were correct. Not explained.
