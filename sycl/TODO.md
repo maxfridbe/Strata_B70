@@ -24,17 +24,21 @@ Above 32K context the prompt path borrows VRAM cache slots and refills them from
 round: ~1 s per request (950 ms for 1,050 slots). With served 128K/256K configs that is most of the gap between a
 2,185-token prompt at 479 tok/s and the 32K config's 790.
 
-- [ ] Decode starts at once; the lent experts are read from the pinned host mirror over PCIe (the device plan
-      already reads mirrored experts) while a background thread refills their VRAM slots.
-- [ ] Test: Coder and IQ2_XS at 2,185 / 8K / 40K tokens, output tokens identical to the blocking refill, TTFT and
-      decode against benchy v1.
+- [x] Done another way (2026-10-04, simpler and safer than refilling during decode): the lendable experts are
+      mirrored in pinned RAM at start, so the prompt path DMAs them per chunk (it read them from the GGUF) and the
+      refill copies from RAM (`STRATA_LEND_MIRROR=0` turns it off). Outputs identical (Coder 2,185 / 8K / 40K,
+      IQ2_XS 2,185 / 8K, cold cache). Prompt reading Coder 456 -> 610 / 802 -> 946 / 988 -> 1,046 tok/s, IQ2_XS
+      303 -> 500 / 565 -> 720; refill 720-2,240 -> 200-380 ms; Coder 2,185-token TTFT 4.74 -> 3.87 s. Costs 1.9-2.3
+      GiB of RAM and ~2 s at start.
+- [ ] Still open: decode before the refill lands (would take the remaining ~0.3 s off TTFT).
 
 ## 3. Long prompts (parity tests + 40K-256K runs)
 
 At 40K: expert GEMMs 23%, attention 19%, dequant 16%, QSA select 7%, host grouping 6.5%, gather 6%.
 
-- [ ] **3a. Expert grouping on the GPU.** Each layer's routed (token, expert) pairs are grouped on the host after a
-      sync. A device-side bucketing removes the per-layer round trip (6.5% at 40K).
+- [x] **3a. Expert grouping on the GPU: not worth it** (measured 2026-10-04). Host timers over a 40K prompt's 528
+      groupings: the loops 47 ms, the uploads 24 ms, and 2,336 ms the profiler's own event fold - the "6.5%" was
+      mostly the measurement. The 26 s "drain wait" is the host waiting for GPU work it had queued, not idle GPU.
 - [ ] **3b. QSA block selection.** Every query against every pooled block: 7% at 40K, 9% of an 80K prompt, more at
       256K.
 - [ ] **3c. Prompt attention's K/V gather.** The FP32 fallback kernel (19% at 40K); vector loads, sub-group
