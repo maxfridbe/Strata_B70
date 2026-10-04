@@ -777,8 +777,8 @@ GB/s against a measured 426 GB/s streaming ceiling with 16-byte loads). Measured
   retrieved (Cloudflare challenge), so its claims are unverified here.
 
 **Q6_K served from a repacked layout (done).** Every Q6_K block is 210 bytes, so its 16-byte loads start at 2-byte-aligned
-addresses and the kernel needs a two-load-and-shift workaround (`load16_a2`). With `STRATA_SYCL_NO_XMX`-style opt-out aside, the
-loaders (`native_dense.cpp`, `native_head.cpp`) now pad each block to 224 bytes on the host before the upload, under a new
+addresses and the kernel needs a two-load-and-shift workaround (`load16_a2`). The loaders
+(`native_dense.cpp`, `native_head.cpp`) now pad each block to 224 bytes on the host before the upload, under a new
 type tag 114 (`native_mmvq_serving_type`, `native_mmvq_pack`; `STRATA_Q6K_STRIDE224=0` keeps the GGUF layout). The decode kernel
 (`native_q6_k_mmvq_s224`, the wide kernel with aligned weight loads and scalar activation loads, at most 4 columns a launch:
 5 and 6 columns in one launch spill registers, 0.14x) and the prefill dequantiser (`dequant_bf16.dp.cpp`) know the tag; any
@@ -787,6 +787,17 @@ other consumer fails loudly on an unknown type instead of misreading. Results ar
 1.20x (2560x12288), 1.12x (the 248,320-row head), about 1.3x at 4 columns, 0.93x at 1. Whole GPU-only decode, 128 tokens, same
 tokens: **10.37 and 10.36 tok/s against 9.77 and 9.76** (+6.2%); load time unchanged (25-26 s of wall time either way; the
 repack of about 1.9 GB is a fraction of a second); the weights grow from 2,019 to 2,105 MiB.
+
+**The hyper-connection read (`fused_gr_read_multi`), looked at and left alone.** It is about 24 ms of the 100 ms round (norm,
+down, reduce and up kernels back to back; `gr_bench` on the A770: 153-220 us for 1-6 tokens, the B70's notes say 76-108 us at 6).
+`unitrace` on `gr_bench` puts the up kernel at the top, but its token-mixed average overstates it. An ablation of the up
+kernel at 2 tokens (total 166 us): skipping its weight loads saves 35 us (that is its memory work, about 190 GB/s), skipping the
+prologue, the epilogue loads or the stores about 4-5 us each, skipping all three loads leaves 95 us, which is the other three
+kernels and the gaps between the launches. The tile width (`UPM_COLS`) gives 166 / 304 / 237 / 152 us at 16 / 8 / 4 / 2 (bit
+identical); `STRATA_GR_V3=1` has no effect on the port's path, `STRATA_GR_DOWN_SLICED=0` is 1.5x slower, `STRATA_GR_DOWN_DIRECT=0`
+is the same. The sliced down kernel spills about 38 registers (the link log says so for SIMD32 at 128 registers) and
+`gdn_step_norm_multi` also warns. A real gain would come from merging the norm and down stages and shortening the chain of four
+launches, worth about 6 ms of the round; not done.
 
 **Adaptive swaps (fixed).** The default `--adapt-every 4` used to zero the output after the first swap. The swap itself was
 sound: the device residency table matched the host's and the swapped-in slots were byte-identical to the GGUF. An evicted expert
