@@ -1,0 +1,33 @@
+# Strata SYCL port - serving image for an Intel Arc A770 (dg2-g10, ahead-of-time compiled).
+# Build from the repo root:  docker build -f sycl/tools/Dockerfile.serve -t strata-sycl .
+# The model, its pack and the expert profile stay outside the image (mounted at run time, docs/INTEL.md).
+ARG BASE=ghcr.io/snailium/llama.cpp-sycl-intel-b70/llama-sycl-b70:stable
+
+FROM ${BASE} AS build
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+      ninja-build cmake git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY . /src
+RUN . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 \
+    && cmake -S /src/sycl -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+         -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+         -DSTRATA_SYCL_AOT=dg2-g10 -DSTRATA_SYCL_NO_XMX=ON -DSTRATA_SYCL_LARGE_BUFFERS=ON -DSTRATA_SYCL_PARITY=OFF \
+    && cmake --build /build --target strata -j "$(nproc)"
+
+FROM ${BASE}
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+      python3 python3-pip python3-venv \
+    && python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir numpy jinja2 regex pyyaml pillow psutil requests tqdm \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/strata
+COPY --from=build /build/strata build-sycl-aot/strata
+COPY serve serve
+COPY tools tools
+COPY sycl/serve sycl/serve
+COPY data data
+ENV PATH=/opt/venv/bin:$PATH \
+    ONEAPI_DEVICE_SELECTOR=level_zero:0 SYCL_CACHE_PERSISTENT=0 ZES_ENABLE_SYSMAN=1 \
+    IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1 UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 \
+    STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1
+ENTRYPOINT ["python", "sycl/serve/server_intel.py"]
