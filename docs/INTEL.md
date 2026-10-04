@@ -739,6 +739,44 @@ now counts the routed experts on the GPU (`resident_plan_set_usage`) and the eng
 What is left is spread out: the Q6_K projections run at about a quarter of the card's memory bandwidth (137 us per call for
 about 21 MB), `gr_up_multi` takes 159 us for a small projection, and the GPU idles for about 16% of the round between kernels.
 
+**Kernel work on the GPU-only path: what was tried (A770, 2026-10-04).** After the expert kernels, the biggest item in the 100 ms
+round is `native_mmvq_q6k_wide` (the Q6_K projections and the LM head: 129 tensors, about 1.9 GB per round, 17.7 ms, about 106
+GB/s against a measured 426 GB/s streaming ceiling with 16-byte loads). Measured with `mmvq_bench` on the model's real shapes
+(2560x10240, 2560x6144, 6144x2560, 2560x12288, and the 2560x248320 head; 2 columns, GB/s of weights):
+
+| variant | 10240 | 6144 | 6144x2560 | 12288 | head |
+|---|---|---|---|---|---|
+| default (aligned-load `a2` kernel), no large-buffer option | 164 | 134 | 154 | 171 | 243 |
+| the same linked with `-ze-opt-greater-than-4GB-buffer-required` (`STRATA_SYCL_LARGE_BUFFERS=ON`) | 142 | 113 | 130 | 149 | 220 |
+| misaligned loads (`STRATA_MMVQ_A2=0`) | 117 | 103 | 61 | 123 | 146 |
+| weight loads issued ahead, `STRATA_MMVQ_PF=2 / 3 / 4` | 129 / 105 / 64 | 113 / 95 / 59 | 127 / 110 / 70 | 136 / 110 / 65 | 167 / 132 / 76 |
+| 2 / 3 / 4 rows per sub-group, aligned loads | 51 / 41 / 33 | 60 / 49 / 41 | 99 / 77 / 54 | 53 / 39 / 30 | 53 / 43 / 34 |
+| the shared kernel (`STRATA_MMVQ_WIDE=0`) | 62 | 60 | 61 | 63 | 65 |
+| blocks repacked at a 224-byte stride (`q6k_align_bench`) | 186 vs 162 | | 142 vs 102 | 162 vs 101 | 267 vs 135 |
+
+- Nothing existing beats the default. The repacked 224-byte stride is 1.15-1.98x faster at 2 columns (and much slower at 4 or
+  more), worth about 4.5 ms of the 100 ms round, and costs a repack at load and 6.7% more memory for those tensors. Not done.
+- `strata::dp4a` (byte unpack and multiply-add, which the source says IGC turns into the DP4A instruction) runs at 730 G dp4a/s
+  in a microbenchmark against 2,654 G/s for `__builtin_IB_dp4a_ss`; but the microbenchmark is not a clean isolation (see below),
+  and swapping the builtin into the kernel changed nothing (identical GB/s to the digit in the same build). The Q6_K kernel is
+  not limited by dot-product throughput: going from 1 to 2 columns raises its time 1.6x for the same weight bytes, but a
+  4x faster dp4a does not help, so it is bound by load latency, issue or occupancy. The builtin differs from the emulation only
+  where the int32 accumulator saturates (12 of 4 million random inputs, all near +-2^31).
+- The 14% above is the AOT option that `STRATA_SYCL_LARGE_BUFFERS=ON` adds (stateless addressing for every kernel). Over a whole
+  decode it costs only 1.6% (6.84 vs 6.73 tok/s at a cache under 4 GiB, identical output), because the Q6_K kernel is about a
+  sixth of the round. Splitting the expert cache into arenas under 4 GiB to drop the option is not worth it.
+- An outside review of the dp4a numbers: the microbenchmark (`dp4a.cpp`) lets the emulated form share byte extraction because
+  its operands are correlated and only the sum escapes, and an opaque builtin call blocks that, so 3.6x is not a trustworthy rate;
+  the instruction-level cause of the kernel's ceiling has not been found (the missing measurement is the ISA: count dp4a, sends
+  and spills from `ocloc disasm` for both forms). The Q6_K dequant (`dpct::vectorized_binary<char4>(.., sub_sat)`) has an exact
+  cheaper form (values are 0..63 minus 32, so `((x | 0x80808080) - 0x20202020) ^ 0x80808080`); not tried.
+- The matrix engine (XMX, up to 256 int8 ops per clock per unit, against DP4A on the vector ALUs): not useful for decode here,
+  since nothing in decode is arithmetic-bound, and the fork's own notes record three int8 `joint_matrix` expert variants being
+  1.4-3x slower than dp4a (one hung the GPU). It could matter for the prompt path (dequant to int8 plus an int8 GEMM, if int8 is
+  at least 1.5x faster than the fp16 GEMM on the real shapes) but IGC crashes on the fp16 `joint_matrix` kernels for dg2 and
+  nobody has probed int8. The Intel blog post that prompted this (community.intel.com, "Engineering Arc 3/30/2022") could not be
+  retrieved (Cloudflare challenge), so its claims are unverified here.
+
 **Adaptive swaps (fixed).** The default `--adapt-every 4` used to zero the output after the first swap. The swap itself was
 sound: the device residency table matched the host's and the swapped-in slots were byte-identical to the GGUF. An evicted expert
 had never been mirrored in pinned host memory, so the GPU could not read it and the device plan waited for the host, whose flags
