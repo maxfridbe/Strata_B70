@@ -39,10 +39,15 @@ At 40K: expert GEMMs 23%, attention 19%, dequant 16%, QSA select 7%, host groupi
 - [x] **3a. Expert grouping on the GPU: not worth it** (measured 2026-10-04). Host timers over a 40K prompt's 528
       groupings: the loops 47 ms, the uploads 24 ms, and 2,336 ms the profiler's own event fold - the "6.5%" was
       mostly the measurement. The 26 s "drain wait" is the host waiting for GPU work it had queued, not idle GPU.
-- [ ] **3b. QSA block selection.** Every query against every pooled block: 7% at 40K, 9% of an 80K prompt, more at
-      256K.
-- [ ] **3c. Prompt attention's K/V gather.** The FP32 fallback kernel (19% at 40K); vector loads, sub-group
-      cooperation. The XMX versions lost twice; this stays on the vector units.
+- [x] **3b. QSA block selection: done** (2026-10-04). The scores as oneMKL fp32 GEMM tiles plus a relu-sum
+      (`sel_scores_bench`: 7.3-8.4x the per-pair kernel at 40K-256K, relative error 2-4e-7). Coder TTFT 256K
+      328.6 -> 258.2 s (780 -> 992 tok/s), 128K 138.9 -> 122.9 s, 40K 38.4 -> 37.4 s; IQ2_XS 40K 762 -> 785 tok/s.
+      Not bitwise (as the CUDA build's 3xTF32 path): outputs follow the same text and part at a near-tie after 13-93
+      tokens, equally coherent. `STRATA_SELECT_GEMM=0`: the old kernel.
+- [ ] **3c. Prompt attention's K/V gather.** The fallback kernel (19% at 40K, ~48 s of a 256K prompt). Each query
+      gathers ~2 MB of scattered K/V per layer and the kernel moves ~130 GB/s of a 608 GB/s card; its score phase
+      spends 60 sub-group shuffles per cell (12 heads x a 5-step tree). Candidate: scores as thread-per-(cell, head)
+      dots over K staged in local memory. Uncertain (gather-bound); the XMX versions lost twice.
 
 ## Later
 
