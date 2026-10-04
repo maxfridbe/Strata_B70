@@ -934,7 +934,7 @@ __dpct_inline__ void resident_plan_kernel(
     const int32_t *__restrict__ res, int n_expert, const uint8_t *cache_base,
     const unsigned long long *slot_off, long long blob,
     int32_t *__restrict__ pl, long long capx, uint32_t *skip, uint32_t ring,
-    const unsigned long long *__restrict__ mir, bool par) {
+    const unsigned long long *__restrict__ mir, bool par, uint32_t *use) {
 #if STRATA_PLAN_LOCAL
     // SYCL port: the host's exact loop, but over a local copy of the ids and their slots. One thread reading global
     // memory for every compare (n^2 of them) took 87 us per layer on the B70 - 4% of a decode round; a work-group
@@ -951,6 +951,9 @@ __dpct_inline__ void resident_plan_kernel(
         const int32_t e = ids[i];
         const bool valid = e >= 0 && e < n_expert;
         const int32_t sl = valid ? res[e] : -1;
+        if (use != nullptr && valid)   // how often each expert is routed to: the adaptive tier's input without a host pool
+            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>(use[e]).fetch_add(1u);
         const unsigned long long ma = (valid && sl < 0 && mir != nullptr) ? mir[e] : 0ull;   // mirrored in host memory
         s_ids[i] = e;
         s_res[i] = sl;
@@ -1118,7 +1121,9 @@ __dpct_inline__ void copy_or_zero_kernel(sycl::float4 *__restrict__ dst,
 namespace {
 const int32_t* g_mirror_res = nullptr;
 const unsigned long long* g_mirror_table = nullptr;
+uint32_t* g_usage_table = nullptr;
 }
+void resident_plan_set_usage(uint32_t* usage_table) { g_usage_table = usage_table; }
 void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mirror_table) {
     g_mirror_res = d_res;
     g_mirror_table = mirror_table;
@@ -1129,6 +1134,9 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     const unsigned long long* mir = nullptr;   // SYCL port: the layer's slice of the host-mirror table, if any
     if (g_mirror_table != nullptr && g_mirror_res != nullptr && res_layer >= g_mirror_res)
         mir = g_mirror_table + (res_layer - g_mirror_res);
+    uint32_t* use = nullptr;   // SYCL port: the layer's slice of the usage counters, if they are on
+    if (g_usage_table != nullptr && g_mirror_res != nullptr && res_layer >= g_mirror_res)
+        use = g_usage_table + (res_layer - g_mirror_res);
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
@@ -1140,7 +1148,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
                 exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
                     resident_plan_kernel(ids, n_entries, k, res_layer, n_expert,
                                          cache_base, slot_off, blob, plan, capx,
-                                         skip, ring, mir, par);
+                                         skip, ring, mir, par, use);
                 });
     }
     check("resident_plan");

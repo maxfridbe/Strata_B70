@@ -4791,6 +4791,25 @@ int main(int argc, char **argv) try {
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
+        // GPU-only runs (STRATA_VERIFY_NO_HOST) have no host pool to see the routing, so the adaptive tier would never
+        // have anything to rank: the plan kernel counts the routed experts on the device instead
+        uint32_t* usage_d = nullptr;
+        const size_t usage_n = (size_t) (g.n_layers * g.n_expert);
+        if (mirror_table_d && o.adapt_every > 0 && o.adapt_swaps > 0 && std::getenv("STRATA_VERIFY_NO_HOST") != nullptr &&
+            std::getenv("STRATA_VERIFY_DEVICE_PLAN") != nullptr) {
+            usage_d = sycl::malloc_device<uint32_t>(usage_n, dpct::get_in_order_queue());
+            if (usage_d != nullptr) {
+                dpct::get_in_order_queue().memset(usage_d, 0, usage_n * 4).wait();
+                strata::kernels::resident_plan_set_usage(usage_d);
+            }
+        }
+        auto fold_device_usage = [&]() {   // the counters since the last call, into the adaptive tier's usage
+            if (usage_d == nullptr || drive.d.usage.size() != usage_n) return;
+            std::vector<uint32_t> cnt(usage_n);
+            dpct::get_in_order_queue().memcpy(cnt.data(), usage_d, usage_n * 4).wait();
+            dpct::get_in_order_queue().memset(usage_d, 0, usage_n * 4).wait();
+            for (size_t i = 0; i < usage_n; ++i) drive.d.usage[i] += (float) cnt[i];
+        };
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
@@ -6146,8 +6165,10 @@ int main(int argc, char **argv) try {
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
-                if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
+                if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0) {
+                    fold_device_usage();
                     adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                }
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
@@ -6881,6 +6902,25 @@ int main(int argc, char **argv) try {
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         if (mirror_table_d) strata::kernels::resident_plan_set_mirror(thits.d_res, mirror_table_d);
+        // GPU-only runs (STRATA_VERIFY_NO_HOST) have no host pool to see the routing, so the adaptive tier would never
+        // have anything to rank: the plan kernel counts the routed experts on the device instead
+        uint32_t* usage_d = nullptr;
+        const size_t usage_n = (size_t) (g.n_layers * g.n_expert);
+        if (mirror_table_d && o.adapt_every > 0 && o.adapt_swaps > 0 && std::getenv("STRATA_VERIFY_NO_HOST") != nullptr &&
+            std::getenv("STRATA_VERIFY_DEVICE_PLAN") != nullptr) {
+            usage_d = sycl::malloc_device<uint32_t>(usage_n, dpct::get_in_order_queue());
+            if (usage_d != nullptr) {
+                dpct::get_in_order_queue().memset(usage_d, 0, usage_n * 4).wait();
+                strata::kernels::resident_plan_set_usage(usage_d);
+            }
+        }
+        auto fold_device_usage = [&]() {   // the counters since the last call, into the adaptive tier's usage
+            if (usage_d == nullptr || drive.d.usage.size() != usage_n) return;
+            std::vector<uint32_t> cnt(usage_n);
+            dpct::get_in_order_queue().memcpy(cnt.data(), usage_d, usage_n * 4).wait();
+            dpct::get_in_order_queue().memset(usage_d, 0, usage_n * 4).wait();
+            for (size_t i = 0; i < usage_n; ++i) drive.d.usage[i] += (float) cnt[i];
+        };
         vh.cache_base = thits.cache_base;
         vh.blob = thits.blob;
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
@@ -7162,8 +7202,10 @@ int main(int argc, char **argv) try {
             // GPU commits and drafts; it touches only the residency tables, which nothing reads until the next window
             std::thread adapt_thr;
             bool adapt_ok = true;
-            if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
+            if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0) {
+                fold_device_usage();
                 adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+            }
             // SYCL port: the commit graph is left running while the drafter's round (its own queue) runs; collected
             // below, before anything reads the committed state
             if (!ver.commit(a + 1, err, /*wait=*/!use_mtp)) {
