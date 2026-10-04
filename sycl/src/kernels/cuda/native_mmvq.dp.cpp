@@ -34,6 +34,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -2095,7 +2096,10 @@ void native_q6_k_mmvq_s224(const void* weights, const void* x_q8_1, float* y, in
     }
 }
 int native_mmvq_serving_type(int ggml_type) {
-    static const bool on = std::getenv("STRATA_Q6K_STRIDE224") == nullptr || std::atoi(std::getenv("STRATA_Q6K_STRIDE224")) != 0;
+    static const bool on = [] {
+        const char* value = std::getenv("STRATA_Q6K_REPACK");
+        return value && std::strcmp(value, "1") == 0;
+    }();
     return ggml_type == 14 && on ? kNativeQ6KStride224 : ggml_type;
 }
 void native_mmvq_pack(int serving_type, const void* gguf_bytes, int n_in, int n_out, void* packed) {
