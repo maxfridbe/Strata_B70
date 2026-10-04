@@ -634,8 +634,9 @@ build-sycl-aot/strata --pack <iq pack> --native <shard1> --ple-gguf <shard2> --e
     --stream-experts --expert-cache auto --vram-reserve-mib 1024 --prefill auto --spec 2 --suffix-draft 0 ...
 ```
 
-This is the host-plan path: the CPU computes part of the experts that miss VRAM beside the GPU. For a GPU-only run add
-`STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1` (slower here: 7.1 tok/s, see below).
+This is the host-plan path: the CPU computes part of the experts that miss VRAM beside the GPU (8.0-8.7 tok/s). For a GPU-only
+run add `STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1`: 9.75 tok/s, the faster of the two (see "Why the GPU-only path was
+slow").
 
 **What differs from the B70, and what each difference needed.**
 
@@ -652,8 +653,8 @@ This is the host-plan path: the CPU computes part of the experts that miss VRAM 
 
 The A770 has one compute queue and one copy queue (the B70 has more), 512 EUs, 64 KiB of local memory per work-group.
 
-**Speed.** Decode is 8.0-8.6 tok/s on the host-plan path (llama.cpp's SYCL backend, same GGUF, same card: 9.4-9.8), prompt reading
-11-23 tok/s on a 19-token prompt. 4,836 of the 12,288 experts fit in VRAM; the other 7,452 are mirrored in pinned host memory and read by the
+**Speed.** Decode is 9.75 tok/s GPU-only and 8.0-8.7 on the host-plan path (llama.cpp's SYCL backend, same GGUF, same card:
+9.4-9.8), prompt reading 11-23 tok/s on a 19-token prompt. 4,836 of the 12,288 experts fit in VRAM; the other 7,452 are mirrored in pinned host memory and read by the
 GPU over PCIe.
 
 | setting | decode |
@@ -717,6 +718,26 @@ Their settings were swept on the host-plan path, 256 tokens, `--spec 2 --suffix-
 Nothing beat the default, and the differences are within run-to-run noise (about 0.4 tok/s). More slots or more aggressive swapping
 does not help because a round takes about 100 ms of GPU time whether the CPU computes 2 experts per layer or 4: the limit is now
 the GPU's kernels, not where the experts live.
+
+**Why the GPU-only path was slow, found with unitrace.** `unitrace -d` (build it from `intel/pti-gpu`, tools/unitrace, as
+`sycl/tools/Dockerfile.unitrace` does) prints the device time per kernel; the decode rounds are the difference between a short
+and a long run. The GPU was 88% busy: 141 ms of kernel time in each 161 ms round, of which 78 ms (55%) was the routed-expert
+kernels (`native_gu_port`, `native_down_port`), 0.85 ms per layer-token for the 17 MB of expert weights it touches (from VRAM
+that is 0.03 ms): they were reading the mirrored experts over PCIe at about 9 GB/s. With `STRATA_VERIFY_NO_HOST` nothing on the
+host sees the routing, so the adaptive tier (which lifts the hit rate from a third to 87%) had nothing to rank. The plan kernel
+now counts the routed experts on the GPU (`resident_plan_set_usage`) and the engine feeds the counts to the adaptive tier:
+
+| GPU-only, per decode round | before | after |
+|---|---|---|
+| kernel time | 141 ms | 100 ms |
+| expert kernels (gu_port + down_port) | 78 ms | 31 ms |
+| `native_mmvq_q6k_wide` (129 calls) | 17.7 ms | 17.7 ms |
+| `fused_gr_read_multi` (hyper-connection reads) | 24 ms | 24 ms |
+| `gdn_step_norm_multi` | 4.2 ms | 6.7 ms |
+| decode, 128 tokens | 7.14 tok/s | 9.76, 9.74 tok/s (9.77 at 256 tokens) |
+
+What is left is spread out: the Q6_K projections run at about a quarter of the card's memory bandwidth (137 us per call for
+about 21 MB), `gr_up_multi` takes 159 us for a small projection, and the GPU idles for about 16% of the round between kernels.
 
 **Adaptive swaps (fixed).** The default `--adapt-every 4` used to zero the output after the first swap. The swap itself was
 sound: the device residency table matched the host's and the swapped-in slots were byte-identical to the GGUF. An evicted expert
