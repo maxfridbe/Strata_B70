@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <utility>
 #include <cstring>
+#include <cstdlib>
 
 namespace strata::core {
 
@@ -161,6 +162,17 @@ bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
 #endif
 
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert,
+                       int64_t blob_bytes, std::string& err) {
+    if (!open_storage(n_slots, n_layers, n_expert, blob_bytes, err)) return false;
+    if (reversed_) {
+        off_.resize((size_t) slots_ + 1);
+        for (int64_t i = 0; i <= slots_; ++i) off_[(size_t) i] = (uint64_t) i * (uint64_t) blob_;
+        detail::reverse_cache_offsets(off_);
+    }
+    return upload_offsets(err);
+}
+
+bool ExpertCache::open_storage(int64_t n_slots, int64_t n_layers, int64_t n_expert,
                        int64_t blob_bytes, std::string &err) try {
     close();
     if (n_slots <= 0) {
@@ -236,6 +248,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert,
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     blob_ = blob_bytes;
+    reversed_ = detail::cache_reverse(want, std::getenv("STRATA_CACHE_REVERSE"));
 #if defined(STRATA_USE_HIP)
     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
         close();
@@ -272,9 +285,10 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         mx = slot_bytes[i] > mx ? slot_bytes[i] : mx;
     }
     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
-    if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
+    if (!open_storage((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
     slots_ = (int64_t) slot_bytes.size();
     blob_ = mx;
+    if (reversed_) detail::reverse_cache_offsets(off);
     off_ = std::move(off);
 #if defined(STRATA_USE_HIP)
     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
@@ -290,6 +304,19 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         layer_slot_range(l, lo, hi);
         layer_next_[(size_t) l] = (int32_t) lo;
     }
+    return upload_offsets(err);
+}
+
+bool ExpertCache::upload_offsets(std::string& err) {
+    if (off_.empty()) return true;
+    auto& q = dpct::get_in_order_queue();
+    off_device_ = sycl::malloc_device<uint64_t>((size_t) slots_, q);
+    if (!off_device_) {
+        err = "ExpertCache: slot offset allocation failed";
+        close();
+        return false;
+    }
+    q.memcpy(off_device_, off_.data(), (size_t) slots_ * sizeof(uint64_t)).wait();
     return true;
 }
 
@@ -299,7 +326,10 @@ void ExpertCache::close() {
     blocking_staging_ = nullptr;
     blocking_staging_bytes_ = 0;
 #endif
+    if (off_device_) sycl::free(off_device_, dpct::get_in_order_queue());
+    off_device_ = nullptr;
     off_.clear();
+    reversed_ = false;
     if (base_ != nullptr) {
         sycl::free(base_, dpct::get_in_order_queue());
         base_ = nullptr;

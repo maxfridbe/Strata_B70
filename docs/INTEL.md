@@ -537,10 +537,16 @@ expert cache ("no room").
   kernels, and fp16 oneMKL GEMMs of 256^3, all correct at every offset up to 8.2 GiB. `SYCL_PROGRAM_COMPILE_OPTIONS` does not change
   it: oneMKL's kernels are prebuilt. Zeroing the loan, and giving the KV staging its own allocation, do not help.
 - **Reproduce.** `sycl/tests/repro/mkl_gemm_4gib.cpp` (build line in its header).
-- **Mitigation.** Start with `--no-prefill-borrow` (the engine warns when it borrows from a cache over 4 GiB). With a 8.2 GiB
+- **Mitigation.** `--no-prefill-borrow` uses separate prompt buffers. With an 8.2 GiB
   cache and its own prompt buffers, decode was 13.7-14.3 tok/s and 30k-token prompts were correct.
-- **Real fix, not done.** Split the cache into allocations under 4 GiB, or put the loan in the first 4 GiB. Report to the oneMKL
-  team with the reproducer.
+- **Cache layout fix (GPU validation pending).** The SYCL cache now reverses slot addresses automatically when its allocation
+  exceeds 4 GiB. Profile rank stays the slot index: the coldest slots are at the lowest addresses. Loans start at offset zero
+  and include at most `floor(3.9 * 2^30)` bytes, including whole-slot padding. A larger request uses a smaller chunk or the
+  existing own-buffer fallback. `STRATA_CACHE_REVERSE=1` forces this layout for small caches; `STRATA_CACHE_REVERSE=0` disables
+  it. The warning now checks whether the actual loan extends past 4 GiB. The large-buffer compiler option is still needed
+  for Strata's own kernels to read experts at higher addresses.
+- **Host test.** `cmake -S sycl/tests -B /tmp/strata-cache-tests && cmake --build /tmp/strata-cache-tests && ctest --test-dir /tmp/strata-cache-tests --output-on-failure`
+  checks uniform and sized layouts, loan limits, and fill/loan/refill addressing without SYCL or a GPU.
 
 ## Not done
 
