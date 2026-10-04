@@ -3333,7 +3333,7 @@ int main(int argc, char **argv) try {
             }
             if (!auto_cache || attempt - failed >= 6) break;
             dpct::get_in_order_queue()
-                .memset(xcache.device_slot(0), 0, (size_t)xcache.bytes())
+                .memset(xcache.device_base(), 0, (size_t)xcache.bytes())
                 .wait();
             dpct::get_current_device().queues_wait_and_throw();
             size_t free_b = 0, total_b = 0;
@@ -3364,6 +3364,8 @@ int main(int argc, char **argv) try {
     if (o.expert_cache > 0) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
+        if (xcache.reversed())
+            std::fprintf(stderr, "strata generate: reversed cache layout: coldest slots at offset zero, prompt loans capped at 3.9 GiB\n");
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -3818,7 +3820,7 @@ int main(int argc, char **argv) try {
         }
         drive.d.cache = &xcache;
         drive.d.cache_stream = main_cs;
-        drive.d.cache_base = (const uint8_t*) xcache.device_slot(0);
+        drive.d.cache_base = (const uint8_t*) xcache.device_base();
         drive.d.cache_blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         drive.d.cache_slot_off = xcache.slot_offsets();
         drive.d.hit_scratch = hit_scratch;
@@ -4471,6 +4473,7 @@ int main(int argc, char **argv) try {
             }
         }
         thits.cache_base = drive.d.cache_base;
+        thits.slot_off = xcache.device_slot_offsets();
         thits.blob = drive.d.cache_blob;
         thits.d_slot = drive.d.d_slot;
         thits.d_dst = drive.d.d_dst;
@@ -4546,14 +4549,7 @@ int main(int argc, char **argv) try {
     }
     auto lend_slots = [&](int64_t c) -> int64_t {
         const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
-        const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-        int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
-        if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
-            k = 0;
-            while (k < xcache.slots() &&
-                   (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[xcache.slots() - k]) < need) ++k;
-        }
-        return k;
+        return xcache.tail_slots(need);
     };
     // `lend_bytes` went with the single-cache serve loan: a participant's loan is priced by `part_bytes` from its
     // OWN cache, and the only other user of the old helper was the serve path's own relayout.
@@ -4694,21 +4690,10 @@ int main(int argc, char **argv) try {
         };
         auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
             const uint64_t need = strata::prefill::Prefill::bytes_needed(g, *p.ses, c);
-            strata::core::ExpertCache& xc = *p.cache;
-            if (xc.slot_offsets() != nullptr) {   // sized slots: from the end until they hold `need`
-                int64_t k = 0;
-                while (k < xc.slots() &&
-                       (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[xc.slots() - k]) < need) ++k;
-                return k;
-            }
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
-            return (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
+            return p.cache->tail_slots(need);
         };
         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
-            strata::core::ExpertCache& xc = *p.cache;
-            return xc.slot_offsets() ? (uint64_t) (xc.bytes() - (int64_t) xc.slot_offsets()[first])
-                                     : (uint64_t) (xc.slots() - first) *
-                                           (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+            return p.cache->tail_bytes(first);
         };
         // #340: a layer split whose caches already hold most experts streams few of them through the prompt path, so
         // the 384-slot ring (sized for a card that streams nearly every expert of a chunk) only makes every stage's
@@ -4862,7 +4847,7 @@ int main(int argc, char **argv) try {
                     }
                 }
                 lend_first = pf_parts[0].first;
-                borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
+                borrow = lend_first >= 0 ? xcache.tail_base(lend_first) : nullptr;
                 borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
             } else if (o.prefill_auto) {
                 o.prefill_chunk = 1024;   // nothing lendable: small buffers of its own
@@ -4888,12 +4873,14 @@ int main(int argc, char **argv) try {
             if (borrow != nullptr)
                 std::fprintf(stderr, "strata serve: the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)\n",
                              (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
-            if (borrow != nullptr && lend_first > 0 && xcache.slots() > lend_first &&
-                (double) borrow_bytes / (double) (xcache.slots() - lend_first) * (double) xcache.slots() > 4294967296.0)
-                std::fprintf(stderr, "strata serve: WARNING: the expert cache is over 4 GiB and the prompt path borrows from "
-                                     "its tail: oneMKL's bf16/f16 GEMMs return zeros for input matrices 4 GiB or more into an "
-                                     "allocation (docs/INTEL.md), so prompts of about 1.5k tokens and up decode to token 0. "
-                                     "Start with --no-prefill-borrow\n");
+            for (const PfPart& p : pf_parts) {
+                if (p.first < 0) continue;
+                const uint64_t offset = (uint64_t) (p.cache->tail_base(p.first) - p.cache->device_base());
+                if (offset + part_bytes(p, p.first) > strata::core::detail::kCacheGemmLimit)
+                    std::fprintf(stderr, "strata serve: WARNING: CUDA%d borrowed prompt region extends past 4 GiB "
+                                         "in the expert allocation; oneMKL bf16/f16 inputs there return zeros. "
+                                         "Use STRATA_CACHE_REVERSE=1 or --no-prefill-borrow\n", p.dev < 0 ? 0 : p.dev);
+            }
             for (size_t i = 1; i < pf_parts.size(); ++i)   // one loan per stage, from that stage's own cache
                 if (pf_parts[i].first >= 0) std::fprintf(stderr, "strata serve:   CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)\n",
                              pf_parts[i].dev, (long long) (pf_parts[i].cache->slots() - pf_parts[i].first),
@@ -4916,7 +4903,7 @@ int main(int argc, char **argv) try {
                 uint64_t sbb = 0;
                 // `first < 0`: no loan was taken (nothing was lendable), so this stage allocates its own buffers
                 if (i + 1 < pf_parts.size() && pf_parts[i + 1].first >= 0) {
-                    sb = st.cache.device_slot(pf_parts[i + 1].first);
+                    sb = st.cache.tail_base(pf_parts[i + 1].first);
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
@@ -5018,7 +5005,7 @@ int main(int argc, char **argv) try {
                             p.first_now = p.first;
                         }
                     lend_first = pf_parts[0].first;
-                    borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
+                    borrow = lend_first >= 0 ? xcache.tail_base(lend_first) : nullptr;
                     borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
                 }
                 err.clear();
@@ -5185,12 +5172,12 @@ int main(int argc, char **argv) try {
                     const strata::core::OnDevice on(gs.dev);
                     strata::core::VerifyHits vs;
                     vs.d_res = gs.d_res;
-                    vs.cache_base = gs.cache.device_slot(0);
+                    vs.cache_base = gs.cache.device_base();
                     vs.blob = thits.blob;
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err);
-                    split_drive.cache_base[st] = gs.cache.device_slot(0);
+                    split_drive.cache_base[st] = gs.cache.device_base();
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
                 }
@@ -6316,7 +6303,7 @@ int main(int argc, char **argv) try {
                     const strata::core::OnDevice on(p.dev);
                     const int32_t first = std::max<int32_t>(p.first, (int32_t) (p.cache->slots() - part_slots(p, want)));
                     if (want != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                        if (!p.sp->relayout(want, p.cache->tail_base(first), part_bytes(p, first), e)) return false;
                         p.first_now = first;
                     }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
@@ -6895,7 +6882,6 @@ int main(int argc, char **argv) try {
             } else if (chunk != o.prefill_chunk) {
                 k = 0;                                 // a fixed chunk that does not fit: its own buffers, as before
             }
-            const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
                 for (size_t i = 0; i < host_res.size(); ++i)
@@ -6907,9 +6893,8 @@ int main(int argc, char **argv) try {
                     .memcpy(d_res, host_res.data(),
                             host_res.size() * sizeof(int32_t))
                     .wait();
-                borrow = xcache.device_slot(first);
-                borrow_bytes = xcache.slot_offsets() ? (uint64_t) (xcache.bytes() - (int64_t) xcache.slot_offsets()[first])
-                                                     : (uint64_t) k * (uint64_t) blob;
+                borrow = xcache.tail_base(first);
+                borrow_bytes = xcache.tail_bytes(first);
                 std::fprintf(stderr, "strata generate: prompt path borrows %lld cache slots (%.2f GiB)\n", (long long) k,
                              (double) borrow_bytes / 1073741824.0);
             }

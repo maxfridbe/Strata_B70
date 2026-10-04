@@ -26,6 +26,8 @@
 // kernel. This is that first step, and the step it unblocks is the one that can be measured.
 #pragma once
 
+#include "strata/core/expert_cache_layout.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -88,8 +90,20 @@ public:
     /// Plan v0.3 P6: slots of the given sizes, back to back (a native pack's blobs differ per layer, and a
     /// profile-filled tier never moves an expert to another layer's slot, so each slot keeps its first size).
     bool open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_layers, int64_t n_expert, std::string& err);
-    /// Byte offset of each slot in the arena (null for uniform slots).
+    /// Byte offset of each slot; the final entry is the total (null for forward uniform slots).
     const uint64_t* slot_offsets() const { return off_.empty() ? nullptr : off_.data(); }
+    const uint64_t* device_slot_offsets() const { return off_device_; }
+    bool reversed() const { return reversed_; }
+    uint8_t* device_base() { return base_; }
+    const uint8_t* device_base() const { return base_; }
+    /// The coldest slot suffix; tail_slots returns slots() + 1 when the reversed loan exceeds 3.9 GiB.
+    uint64_t tail_bytes(int64_t first) const {
+        return detail::cache_tail_bytes(slots_, (uint64_t) blob_, slot_offsets(), reversed_, first);
+    }
+    int64_t tail_slots(uint64_t need) const {
+        return detail::cache_tail_slots(slots_, (uint64_t) blob_, slot_offsets(), reversed_, need);
+    }
+    uint8_t* tail_base(int32_t first) { return device_slot(reversed_ ? (int32_t) (slots_ - 1) : first); }
     void close();
 
     bool valid() const { return base_ != nullptr; }
@@ -159,6 +173,10 @@ public:
     int64_t fills() const { return fills_; }
 
 private:
+    bool open_storage(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes, std::string& err);
+    bool upload_offsets(std::string& err);
+    uint64_t* off_device_ = nullptr;
+    bool reversed_ = false;
 #if defined(STRATA_USE_HIP)
     bool ensure_blocking_staging(std::size_t bytes, std::string& err);
     uint8_t* blocking_staging_ = nullptr;
@@ -176,7 +194,7 @@ private:
     /// pre-existing path is untouched.
     bool per_layer_ = false;
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
-    std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
+    std::vector<uint64_t> off_;         ///< slot offsets and total (slots + 1 entries) when sized or reversed
     int64_t admitted_ = 0;
 };
 
