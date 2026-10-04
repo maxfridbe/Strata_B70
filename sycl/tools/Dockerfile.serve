@@ -8,6 +8,7 @@ RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq 
       ninja-build cmake git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY . /src
+ENV IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1
 SHELL ["/bin/bash", "-c"]
 RUN { source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true; } \
     && cmake -S /src/sycl -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
