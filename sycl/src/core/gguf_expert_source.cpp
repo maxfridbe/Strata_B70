@@ -25,8 +25,7 @@ void GgufExpertSource::close() {
     mirror_chunks_.clear();
     mirror_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
     for (int fd : fds_) if (fd >= 0) ::close(fd);
-    fds_.clear(); names_.clear(); layer_fd_.clear(); ring_.clear(); ring_key_.clear(); where_.clear();
-    ring_next_ = 0;
+    fds_.clear(); names_.clear(); layer_fd_.clear(); ring_.clear(); ring_slots_.reset(0);
 }
 
 bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t n_expert, std::string& err) {
@@ -53,7 +52,7 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
             if (fd_of(l, r, err) < 0) { close(); return false; }
     ring_.resize(kRing);
     for (auto& b : ring_) b.resize((size_t) lay.max_blob);
-    ring_key_.assign(kRing, -1);
+    ring_slots_.reset(kRing);
     return true;
 }
 
@@ -88,16 +87,9 @@ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
     const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
     const uint64_t at[3] = {0, fm.up_off, fm.down_off};
     const int64_t key = ((int64_t) layer << 20) | expert;
-    size_t slot;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = where_.find(key);
-        if (it != where_.end()) { ++reads_; return ring_[it->second].data(); }   // still resident
-        slot = ring_next_;
-        ring_next_ = (ring_next_ + 1) % ring_.size();
-        if (ring_key_[slot] >= 0) where_.erase(ring_key_[slot]);
-        ring_key_[slot] = key;   // reserved; published in where_ only once the read below is complete
-    }
+    const auto reservation = ring_slots_.acquire(key);
+    const size_t slot = reservation.slot;
+    if (reservation.cached) { ++reads_; return ring_[slot].data(); }
     std::vector<uint8_t>& buf = ring_[slot];
     for (int r = 0; r < 3; ++r) {
         const int fd = fds_[(size_t) layer_fd_[(size_t) (3 * layer + r)]];
@@ -105,18 +97,12 @@ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
         uint64_t done = 0;
         while (done < per[r]) {
             const ssize_t n = ::pread(fd, buf.data() + at[r] + done, (size_t) (per[r] - done), (off_t) (src + done));
-            if (n <= 0) { std::lock_guard<std::mutex> lk(mu_); where_.erase(key); ring_key_[slot] = -1; return nullptr; }
+            if (n <= 0) { ring_slots_.finish(slot, false); return nullptr; }
             done += (uint64_t) n;
         }
     }
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        ++reads_;
-        // another caller for the same expert that arrived while this read was in flight read it into a slot of its own
-        // rather than being handed this half-filled buffer (the slot was in where_ before the read, and the pool's
-        // workers, or the two tokens of one window, do ask for the same expert at once)
-        if (ring_key_[slot] == key) where_[key] = slot;
-    }
+    ++reads_;
+    ring_slots_.finish(slot, true);
     return buf.data();
 }
 

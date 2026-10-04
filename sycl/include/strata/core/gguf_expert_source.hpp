@@ -13,11 +13,11 @@
 #pragma once
 
 #include "strata/core/expert_source.hpp"
+#include "strata/core/expert_ring_slots.hpp"
 
 #include <cstdint>
-#include <mutex>
+#include <atomic>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace strata::core {
@@ -63,12 +63,9 @@ private:
     std::vector<std::string> names_;
     std::vector<int> layer_fd_;         ///< per layer and role (3 * layer + role): index into fds_
     std::vector<std::vector<uint8_t>> ring_;
-    std::vector<int64_t> ring_key_;                 ///< (layer << 20 | expert) held by each slot, -1 = empty
-    std::unordered_map<int64_t, size_t> where_;     ///< key -> slot
-    size_t ring_next_ = 0;
-    std::mutex mu_;
+    ExpertRingSlots ring_slots_;
     int64_t n_layers_ = 0, n_expert_ = 0;
-    int64_t reads_ = 0;
+    std::atomic<int64_t> reads_{0};
     std::vector<uint8_t*> mirror_chunks_;          ///< USM host (pinned, device-readable); one allocation each, a driver caps those
     uint64_t mirror_bytes_ = 0;
     std::vector<const uint8_t*> mirror_ptr_;       ///< per (layer, expert): its blob in a chunk, nullptr = not mirrored
