@@ -8,13 +8,15 @@ RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq 
       ninja-build cmake git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY . /src
-RUN . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 \
+SHELL ["/bin/bash", "-c"]
+RUN { source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true; } \
     && cmake -S /src/sycl -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
          -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
          -DSTRATA_SYCL_AOT=dg2-g10 -DSTRATA_SYCL_NO_XMX=ON -DSTRATA_SYCL_LARGE_BUFFERS=ON -DSTRATA_SYCL_PARITY=OFF \
     && cmake --build /build --target strata -j "$(nproc)"
 
 FROM ${BASE}
+SHELL ["/bin/sh", "-c"]
 RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
       python3 python3-pip python3-venv \
     && python3 -m venv /opt/venv \
