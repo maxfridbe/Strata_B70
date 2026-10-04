@@ -151,7 +151,7 @@ def parse(log):
         "cache_slots": g(r"expert cache (\d+) slots", int),
         "cache_gib": g(r"expert cache \d+ slots, ([\d.]+) GiB"),
         "mirror_experts": g(r"(\d+) of \d+ experts missing from VRAM mirrored", int) or 0,
-        "mirror_gib": g(r"mirrored in pinned host memory \(([\d.]+) GiB") or 0.0,
+        "mirror_gib": g(r"experts missing from VRAM mirrored in pinned host memory \(([\d.]+) GiB") or 0.0,
         "lent_slots": g(r"prompt path borrows (\d+) cache slots", int) or 0,
         "lend_mirror_s": g(r"lendable slots mirrored in pinned host memory \([\d.]+ GiB, ([\d.]+) s\)") or 0.0,
         "ple_ssd_mb": g(r"SSD reads \(([\d.]+) MB\)"),

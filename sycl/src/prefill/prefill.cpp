@@ -683,6 +683,7 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
     a.take<float>(T * 128, ok); a.take<float>(T * 512, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
     a.take<int32_t>(T * (size_t) cap, ok);
     a.take<float>((size_t) sel_batch * (size_t) max_blocks, ok);
+    a.take<float>((size_t) sel_batch * 4 * (size_t) kSelTile, ok);   // SYCL port: the block scores' GEMM tile (init's sel_S)
     a.take<float>((size_t) attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(cap, s), ok);
     return a.used;
 }
