@@ -4888,6 +4888,12 @@ int main(int argc, char **argv) try {
             if (borrow != nullptr)
                 std::fprintf(stderr, "strata serve: the prompt path borrows %lld CUDA0 cache slots (%.2f GiB)\n",
                              (long long) (xcache.slots() - lend_first), (double) borrow_bytes / 1073741824.0);
+            if (borrow != nullptr && lend_first > 0 && xcache.slots() > lend_first &&
+                (double) borrow_bytes / (double) (xcache.slots() - lend_first) * (double) xcache.slots() > 4294967296.0)
+                std::fprintf(stderr, "strata serve: WARNING: the expert cache is over 4 GiB and the prompt path borrows from "
+                                     "its tail: oneMKL's bf16/f16 GEMMs return zeros for input matrices 4 GiB or more into an "
+                                     "allocation (docs/INTEL.md), so prompts of about 1.5k tokens and up decode to token 0. "
+                                     "Start with --no-prefill-borrow\n");
             for (size_t i = 1; i < pf_parts.size(); ++i)   // one loan per stage, from that stage's own cache
                 if (pf_parts[i].first >= 0) std::fprintf(stderr, "strata serve:   CUDA%d prompt path borrows %lld of its %lld slots (%.2f GiB)\n",
                              pf_parts[i].dev, (long long) (pf_parts[i].cache->slots() - pf_parts[i].first),

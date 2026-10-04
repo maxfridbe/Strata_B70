@@ -524,6 +524,24 @@ expert cache ("no room").
 - The call is restored, and `tools/fixups.py` re-applies it after a re-migration.
 - Found and tested on 2x B70 by tmking01 in the upstream PR review.
 
+### Long prompts decode to token 0 with a borrowed cache over 4 GiB (root cause found 2026-10-04)
+
+- **Symptom.** In serve mode with an expert cache over 4 GiB, a prompt of about 1.5k tokens or more answers with token 0 forever
+  ("!!!!"), every draft accepted. Short prompts are fine. `--no-prefill-borrow` fixes it; so does a cache under 4 GiB.
+- **Cause.** The prompt path carves its working buffers out of the cache's tail slots. In a big cache those are more than 4 GiB
+  into the allocation, and oneMKL's bf16/f16 to fp32 GEMM (`dpct::blas::gemm`, which `Gemm::bf16/f16/native` call) returns
+  zeros when an input matrix (activations or weights) starts 4 GiB or more into an allocation. The output position does not
+  matter. Small GEMMs (chunks up to about 1024 tokens) use another kernel and are correct, which is why the loan size seemed to matter.
+  The zeros turn into NaN a few operations later.
+- **Not the cause.** 32-bit offsets in Strata's own kernels (the large-buffer AOT flag covers them), memcpy/memset, plain
+  kernels, and fp16 oneMKL GEMMs of 256^3, all correct at every offset up to 8.2 GiB. `SYCL_PROGRAM_COMPILE_OPTIONS` does not change
+  it: oneMKL's kernels are prebuilt. Zeroing the loan, and giving the KV staging its own allocation, do not help.
+- **Reproduce.** `sycl/tests/repro/mkl_gemm_4gib.cpp` (build line in its header).
+- **Mitigation.** Start with `--no-prefill-borrow` (the engine warns when it borrows from a cache over 4 GiB). With a 8.2 GiB
+  cache and its own prompt buffers, decode was 13.7-14.3 tok/s and 30k-token prompts were correct.
+- **Real fix, not done.** Split the cache into allocations under 4 GiB, or put the loan in the first 4 GiB. Report to the oneMKL
+  team with the reproducer.
+
 ## Not done
 
 - **Images,** on both Intel engines. Strata's vision path encodes with `strata-vision` into embeddings the CUDA
