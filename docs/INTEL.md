@@ -237,8 +237,9 @@ port's JIT result across runs on the B70 (the segfault above was llama.cpp's); t
 - `sycl/probe/` holds the small standalone programs behind the platform findings: `doorbell.cpp` (host<->device
   flags), `bw.cpp` (read bandwidth), `hostread.cpp`, `graphbench.cpp`, `nodecost.cpp`, `xmx.cpp`. Build each with
   `icpx -fsycl` in the dev image.
-- `mmvq_bench`, `mmvq_sg_bench`, `q6k_align_bench`, `xmx_gemm_bench`, `xmx_int8_bench` and
-  `native_expert_parity NATIVE_BENCH=1` time kernels in isolation. Warm the clocks first: a 5 ms run measures the
+- `mmvq_bench`, `mmvq_sg_bench`, `q6k_align_bench`, `xmx_gemm_bench`, `xmx_int8_bench`, `sel_scores_bench` (QSA block
+  scores), `attn_bench` (the prompt attention and its variants) and `native_expert_parity NATIVE_BENCH=1` time
+  kernels in isolation. Warm the clocks first: a 5 ms run measures the
   ramp, not the kernel.
 - `STRATA_PLE_TRACE=1` traces each PLE gather.
 - `STRATA_DBG_NAN=1` reports the first non-finite values per layer, including the experts' fp16 GEMM inputs.
@@ -270,8 +271,13 @@ port's JIT result across runs on the B70 (the segfault above was llama.cpp's); t
 - **Prompt-slot borrowing.**
   - **Without it:** the reserve evicts experts from VRAM for good, and decode after a long prompt is slow.
   - **With it:** the prompt path borrows cache slots for its buffers and refills them in about a second afterwards.
-  - **The cost:** a second on short prompts. So the port borrows by default only above a 32K context;
+  - **The cost:** a refill after every prompt. So the port borrows by default only above a 32K context;
     `--prefill-borrow` / `--no-prefill-borrow` decide explicitly.
+  - **The lend mirror.** With `--stream-experts`, the experts in the slots a prompt may lend (the cache's last ones)
+    are also kept in pinned host memory, read once at start. The prompt path DMAs them for each chunk and the
+    refill copies them from RAM, instead of reading the GGUF both times. The same bytes go into the same slots, so
+    outputs are identical. It costs about 2 GB of RAM and about 2 s at start (taken only beyond 8 GiB of free RAM);
+    `STRATA_LEND_MIRROR=0` turns it off.
 - **KV streaming** (`--kv-resident`) keeps the whole KV in pinned host memory and only the attended window in VRAM,
   so the KV pushes no experts out. Setup turns it on from 64K up and keeps INT8, the faster KV format at every size
   measured.
@@ -283,6 +289,26 @@ port's JIT result across runs on the B70 (the segfault above was llama.cpp's); t
   straight at it over PCIe. That is how a model bigger than VRAM runs: the original IQ2_XS keeps about a quarter of
   its experts there.
 
+### The prompt path's QSA kernels
+
+Two kernels of the prompt path differ from the CUDA build's on this card. Both are FP32 in another summation order,
+so outputs are not bitwise those of the older kernels (neither is the CUDA build's tensor-core path): a greedy
+continuation parts at a near-tie after tens of tokens, with the same text. Decode keeps the older kernels.
+
+- **QSA block scores as GEMM tiles.** Each batch of 256 queries' indexer heads is multiplied against the pooled block
+  keys with oneMKL (fp32, tiles of 8,192 blocks, 32 MB of scratch), and a small kernel sums the per-head relus and
+  scores the incomplete tail block. The older kernel scored every (query, block) pair with one sub-group: its cost
+  grows with the square of the context. `STRATA_SELECT_GEMM=0`: the older kernel.
+- **Attention scores one work-item per cell.** The batched attention scores each 128-cell chunk with one work-item
+  per cell holding its key row and all 12 heads' dot products, the query heads read from local memory. The older
+  kernel split each cell over a sub-group and added the parts with 60 shuffles a cell. The values pass and the
+  merge are unchanged; all four KV formats. `STRATA_ATTN_PERCELL=0`: the older kernel.
+- **What limits attention now** (`attn_bench`): fetching the selected K/V rows alone takes a fifth of the kernel's
+  time (neighbouring queries share cells, so they come from cache). The rest is arithmetic on the vector units,
+  most of it the values pass.
+
+The attempts behind these, and the ones that did not help, are in [sycl/TODO.md](../sycl/TODO.md).
+
 ### XMX (Intel's matrix engine)
 
 oneMKL's FP16 GEMMs already run on the XMX units, so the prompt path is bound by the dequant that feeds them, not by
@@ -292,10 +318,12 @@ the products. Every hand-written joint_matrix kernel so far is correct but loses
 - **`xmx_gemm_iq`:** a fused dequant + FP16 GEMM straight from the quantized rows.
 - **`qsa_prompt_attn_xmx` v1 and v2:** the port of the mma.sync prompt attention, opt-in
   (`STRATA_PROMPT_ATTN_XMX=1` for 64-cell chunks with 120 KB of local memory, or `=32`).
-  - This attention is gather-bound: each query position selects its own ~2,000 cells, so the K/V fetch dominates.
+  - 120 KB of local memory leaves room for one work-group per core, and each product runs twice (fp16 hi + lo).
   - Only 12 of the 16 matrix rows are real heads.
-  - Grouping neighbouring positions would cut the gather but multiply the arithmetic, because their selections
-    overlap little. It was not built.
+  - A lean fp16 version of the values pass (2026-10-04, ~50 KB of local memory) lost too. The 16-lane sub-group it
+    needs costs little, so the joint_matrix path itself is what loses here.
+  - Grouping neighbouring positions' cells was not built: their selections overlap little, so it would multiply the
+    arithmetic, and the K/V fetch is not the bottleneck anyway.
 - **Expert dot products on int8 DPAS for decode:** three versions were tried and are not in the tree. At 1-6 rows,
   the grid decode and the packed-B layout cost more than the DPAS saves, and one version hung the GPU.
 - **An int8 DPAS GEMM straight from IQ4_NL for prompts** (`xmx_int8_bench`, standalone).
@@ -365,8 +393,7 @@ destructor ran after the runtime's teardown began.
    ALU-bound.
 2. **Experts missing from VRAM read from pinned host memory over PCIe instead of the SSD:** done (the host mirror).
 3. **KV streaming from 64K up:** done.
-4. **QSA block selection on XMX:** every query against every pooled block, a dense product that grows with the
-   context. Open.
+4. **QSA block selection:** done another way - oneMKL fp32 GEMM tiles (above), not XMX.
 5. **The hot decode kernels re-tuned for Xe2's native 16-wide sub-groups:** tried, no gain in the engine
    (`STRATA_MMVQ_SG`: 16 all, 1 IQ4_XS only, 2 short outputs only; default 32). The real headroom was misaligned
    loads, since fixed:
@@ -390,6 +417,8 @@ destructor ran after the runtime's teardown began.
    - Some of these change the summation order. A long greedy continuation can then flip at a near-tie.
 6. **INT8 prompt GEMMs:** experts dequantized to INT8, run as oneMKL/oneDNN INT8 on XMX. Open. A fused int8 kernel
    was tried (`xmx_int8_bench`) and lost.
+
+The current speedup list, with what was measured for each, is [sycl/TODO.md](../sycl/TODO.md).
 7. **Fewer graph nodes per decode round** (~2,500): norm+rope, scores+top-k, gate+quantize fused. Open.
 8. **Wider speculation** (two draft branches per verify window): the kernels are latency-bound, so it is nearly
    free. Open.

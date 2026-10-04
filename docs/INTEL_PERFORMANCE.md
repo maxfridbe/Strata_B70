@@ -210,6 +210,9 @@ Sampling and the repetition penalty cost nothing measurable.
 | 8,000 tokens (2026-09-30) | 27% | 20% | 14% | host grouping 9%, embeddings + PLE rows 5% |
 | 40K tokens (2026-10-03) | 15.7% | 23.4% | 19.2% | QSA select 6.8%, host grouping 6.5%, DeltaNet recurrence 5.8%, gather 5.7%, hyper-connection reads 4.6%, combine 2.4% |
 
+- **The "host grouping" share is mostly the profiler.** Host timers over a 40K prompt's 528 groupings (2026-10-04): the
+  loops 47 ms, the uploads 24 ms, the profiler's own event fold 2,336 ms. Without `STRATA_PREFILL_TIMING` the grouping
+  costs well under 1%. The rows above predate the 2026-10-04 kernels (QSA select and attention are smaller now).
 - **An 80,000-token prompt** (GPU time, 2026-09-30):
   - expert down GEMM 26.0 s, attention 15.4 s, dequant 12.7 s;
   - QSA block selection 9.3 s (0.2 s at 8K: it scans every block of the context per query);
@@ -379,6 +382,46 @@ Kernel level:
 - **#413, per-key-head DeltaNet:** bit-identical but 8% slower here (727 vs 788 tok/s): opt-in.
 - **`STRATA_GR_DOWN_MAX4=1`:** neutral (793 vs 788 tok/s prompt, 76.2 vs 76.3 decode).
 
+### Prompt-path speedups (2026-10-04)
+
+Each measured by A/B on the served configs (benchy's runner, cold page cache, 256 greedy tokens), the change off
+against on.
+
+**The lend mirror** (the lendable experts in pinned RAM; outputs identical):
+
+| | prompt | prompt reading off -> on | refill after the prompt |
+|---|---:|---|---|
+| Coder | 2,185 | 456 -> 610 tok/s (TTFT 4.74 -> 3.87 s) | 720 -> 258 ms |
+| Coder | 8,000 | 802 -> 946 tok/s | 1,045 -> 379 ms |
+| Coder | 40,000 | 988 -> 1,046 tok/s | 1,043 -> 379 ms |
+| IQ2_XS | 2,185 | 303 -> 500 tok/s | 2,240 -> 202 ms |
+| IQ2_XS | 8,000 | 565 -> 720 tok/s | 1,943 -> 325 ms |
+
+**QSA block scores as oneMKL GEMM tiles:**
+
+| | `sel_scores_bench`, 256 queries | warp kernel | GEMM | relative error vs FP64 |
+|---|---|---:|---:|---|
+| | 10,000 blocks (40K cells) | 2.68 ms | 0.37 ms | 1.0e-7 -> 2.7e-7 |
+| | 32,768 blocks (128K) | 6.78 ms | 0.89 ms | 7.8e-8 -> 3.7e-7 |
+| | 65,536 blocks (256K) | 14.62 ms | 1.74 ms | 1.0e-7 -> 2.5e-7 |
+
+The selections match but for near-ties (one query of 256 differs by 3 cells at 40K). Coder TTFT: 40K 38.4 -> 37.4 s,
+128K 138.9 -> 122.9 s, 256K 328.6 -> 258.2 s; IQ2_XS 40K prompt 762 -> 785 tok/s. The bf16x3 and tf32 compute modes
+were no faster than fp32 here.
+
+**Attention scores one work-item per cell** (`attn_bench`: 32 queries x 2,048 cells, INT8 KV, 131K context):
+
+| variant | time | |
+|---|---:|---|
+| the warp kernel (before) | 0.57 ms | |
+| scores one work-item per cell, 128-cell chunks | **0.37 ms** | kept |
+| the K/V rows fetched, no arithmetic | 0.07 ms | the floor: the kernel is arithmetic-bound |
+
+Coder TTFT: 40K 37.2 -> 33.5 s, 128K 123.0 -> 111.3 s, 256K 258.3 -> 235.1 s. Thirteen other variants are listed in
+sycl/TODO.md (none faster).
+
+**Together, Coder TTFT on its served config:** 40K 38.4 -> 33.5 s, 128K 138.9 -> 111.3 s, 256K 328.6 -> 235.1 s (-28%).
+
 ### XMX experiments (all kept opt-in or not built)
 
 | experiment | result |
@@ -389,6 +432,8 @@ Kernel level:
 | `qsa_prompt_attn_xmx` v2 | 1.4-1.5x faster than v1, still ~2x slower (13.4 vs 5.5 ms per chunk, INT8, 32K) |
 | v2 in the full prompt (`STRATA_PROMPT_ATTN_XMX=1`) | 23-33% slower: 128K int8 666 vs 960 tok/s, k8v4 596 vs 983; 256K k8v4 506 vs 752, int8 536 vs 718 |
 | expert dots on int8 DPAS for decode (three versions) | 1.4x and 2-3x slower than dp4a; the third hung the GPU |
+| prompt attention, the tree's v2 (`attn_bench`, 2026-10-04) | 1.68 ms against 0.37 for the per-cell vector kernel (120 KB of local memory: one work-group per core) |
+| prompt attention, a lean fp16 XMX values pass (`attn_bench`, 2026-10-04) | 1.6-2.1 ms against 0.37 (sub-group 16 alone: 0.42) |
 | int8 DPAS GEMM straight from IQ4_NL (`xmx_int8_bench`, 2026-10-03) | within 0.5% of exact; vs dequant + oneMKL: 0.94-0.98x at 16-32 rows, 0.49-0.73x at 64-128, 0.37-0.55x at 256, 0.25-0.38x at 512 |
 
 - **Grouped prompt attention, never built:** measured on the last chunk of an 80K prompt, 8 consecutive positions
