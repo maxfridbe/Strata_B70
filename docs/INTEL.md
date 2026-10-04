@@ -728,6 +728,28 @@ pass and the same five do not); `STRATA_GR_DOWN_MAX4=1` makes no difference here
 prototype, makes IGC for dg2 die with a floating point exception, like the fp16 `joint_matrix` kernels, so it is built only
 without `STRATA_SYCL_NO_XMX`; upstream measured it 0.38-0.98x of dequant + oneMKL on the B70 and not worth an engine port.
 
+**Against llama.cpp in llama-bench's shapes (2026-10-04).** The same Coder IQ1_M GGUF on the same A770 (xe driver, host Xeon E5 v4),
+the card free, one session. llama.cpp b11223 SYCL through `llama-bench -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 -ncmoe 48
+-ot per_layer_token_embd.weight=CPU -lm none -ub 2048 -r 2` (the experts on the CPU, the best flags found for it). Strata GPU-only
+(`STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1`, `--stream-experts --expert-cache auto --vram-reserve-mib 1024 --kv int8
+--spec 2 --suffix-draft 0`), engine 0.1.38-sycl with this branch, driven through its CLI because it has no llama-bench: real text
+from this repo's docs, tokenised with the model's tokenizer; each shape is its own process with its own model load.
+
+| tok/s | llama.cpp | Strata | |
+|---|---:|---:|---|
+| pp512 | 121.6 +- 0.8 | 115 (the first 512-token chunk; 113 with the 512th token) | 0.95x |
+| tg128 | 9.58 +- 0.04 | 10.89 (10.88, 10.91) | 1.14x |
+| pp512 at depth 8192 | 117.6 +- 1.5 | 131 (134, 128) | 1.11x |
+| tg128 at depth 8192 | 8.54 +- 0.78 | 10.46 (10.46, 10.46) | 1.22x |
+| pp20000 (cold) | 223.7 | 312 (64.0 s) | 1.40x |
+| tg64 at depth 20000 | 6.95 | 8.35 | 1.20x |
+
+How the Strata numbers were taken: pp512 is a 512-token prompt in one 512-token chunk (`--prefill 512`); pp512 at depth 8192 is the
+difference between prefilling 8,704 and 8,192 tokens in 512-token chunks (the last chunk, at depth 8192); tg is the decode rate
+over the generated tokens after a prompt of that depth (so it includes the adaptive tier's first swaps, as llama-bench's tg128 includes
+its own warm-up); the 20k prompt uses the engine's own chunking. The first chunk of a prompt costs about 0.5 s more than the others,
+which is why pp512 at depth 0 is below the steady 132 tok/s of the longer prompts; llama.cpp's pp512 shows no such start.
+
 **Open.**
 - Host plan with `--adapt-every 0` produced wrong tokens once (from the second token, the CPU computing 10 experts per layer) in
   three runs; two repeats were correct. Not explained.
