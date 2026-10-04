@@ -169,6 +169,7 @@ docker run --rm -e AOT=bmg-g31 -e BUILD_DIR=/work/<checkout>/build-sycl-aot -e R
 
 - `AOT` is the card's device target: `bmg-g31` for the B70 (what everything here was measured on). The B580 report
   in INTEL_PERFORMANCE.md used `bmg-g21`. `ocloc compile --help` in the image lists the targets (`-device`).
+  Cards of different dies in one layer split need every die's code: a comma list, e.g. `AOT=bmg-g21,bmg-g31`.
 - `JOBS` (default 12) caps the parallel compiles; the B70 machine (23 GB of RAM) builds with `JOBS=8`.
 - `sycl/tools/build.sh <target>` builds one target (`strata`, a parity test, a bench).
 
