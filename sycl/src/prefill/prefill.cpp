@@ -1626,6 +1626,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
     int hand_buf = 0;
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     double grp_wait_ms = 0, grp_cpu_ms = 0;   // the per-layer grouping: the drain wait, the host's loops
+    double grp_fold_ms = 0, grp_submit_ms = 0; int64_t grp_n = 0;   // SYCL port: the timer's fold, the uploads' submit
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
@@ -1940,7 +1941,8 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                     if (m.pp && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
-                    if (gsrc != nullptr) {   // read by the stager's thread when its turn comes (see Stager::Job)
+                    if (gsrc != nullptr && !m.src->pinned(l, e)) {   // read by the stager's thread (see Stager::Job)
+                        // (SYCL port: a pinned one - mirrored in RAM - is DMA'd below like an arena blob)
                         job = (int) js.size();
                         js.push_back({nullptr, (size_t) lay0.blob_bytes(l), nullptr, (int32_t) l, e, gsrc});
                     } else if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
@@ -2587,8 +2589,14 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                         */
                         else m.cs->memcpy(m.ids_host.data(), m.ids,
                                           (size_t)T * K * 4);
+                        const auto tg0 = Clock::now();
                         m.cs->wait();
+                        const auto tg1 = Clock::now();
                         pt.fold();
+                        const auto tg2 = Clock::now();
+                        grp_wait_ms += std::chrono::duration<double, std::milli>(tg1 - tg0).count();
+                        grp_fold_ms += std::chrono::duration<double, std::milli>(tg2 - tg1).count();
+                        ++grp_n;
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
                             /*
                             DPCT1093: The "pe.dev" device may be not the one
@@ -2649,6 +2657,8 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                             slot_h[(size_t) i] = p;
                             src_h[(size_t) p] = (int32_t) (i / K);
                         }
+                        const auto tg3 = Clock::now();
+                        grp_cpu_ms += std::chrono::duration<double, std::milli>(tg3 - tg2).count();
                         if (grp_mapped) {
                             copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
                             copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
@@ -2674,6 +2684,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                             m.cs->memcpy(m.src_dev, m.src_host.data(),
                                          (size_t)T * K * 4);
                         }
+                        grp_submit_ms += std::chrono::duration<double, std::milli>(Clock::now() - tg3).count();
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
                         std::vector<int32_t> order, order_peer;
                         for (int32_t e = 0; e < m.g->n_expert; ++e)
@@ -3547,6 +3558,9 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+        std::fprintf(stderr, "strata prefill timing: host grouping x%lld: drain wait %.0f ms, timer fold %.0f ms, loops "
+                             "%.0f ms, uploads submitted %.0f ms\n", (long long) grp_n, grp_wait_ms, grp_fold_ms, grp_cpu_ms,
+                     grp_submit_ms);
         if (pe.on) {
             /*
             DPCT1093: The "pe.dev" device may be not the one intended for
