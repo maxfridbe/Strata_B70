@@ -47,5 +47,28 @@ int main(int argc, char** argv) {
     s->wait();
     const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it;
     std::printf("q6_k mmvq %d x %d, %d cols: %.1f us  (%.1f GB/s of weights)\n", n_in, n_out, ncols, us, wbytes / us / 1e3);
+    {   // the repacked serving layout (type tag 114: blocks padded to 224 bytes)
+        std::vector<uint8_t> hp((wbytes / 210) * 224);
+        strata::kernels::native_mmvq_pack(strata::kernels::kNativeQ6KStride224, hw.data(), n_in, n_out, hp.data());
+        void* wp = sycl::malloc_device(hp.size(), *s);
+        float* y2 = sycl::malloc_device<float>((size_t) ncols * n_out, *s);
+        s->memcpy(wp, hp.data(), hp.size()).wait();
+        std::vector<float> ya((size_t) ncols * n_out), yb(ya.size());
+        s->memcpy(ya.data(), y, ya.size() * 4).wait();
+        strata::kernels::native_mmvq(strata::kernels::kNativeQ6KStride224, wp, xq, y2, n_in, n_out, ncols, s); s->wait();
+        s->memcpy(yb.data(), y2, yb.size() * 4).wait();
+        double num = 0, den = 0; for (size_t i = 0; i < ya.size(); ++i) { num += std::fabs((double) ya[i] - yb[i]); den += std::fabs((double) ya[i]); }
+        const auto w1 = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w1).count() < 300) {
+            for (int i = 0; i < 20; ++i) strata::kernels::native_mmvq(strata::kernels::kNativeQ6KStride224, wp, xq, y2, n_in, n_out, ncols, s);
+            s->wait();
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < it; ++i) strata::kernels::native_mmvq(strata::kernels::kNativeQ6KStride224, wp, xq, y2, n_in, n_out, ncols, s);
+        s->wait();
+        const double us2 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1).count() / it;
+        std::printf("tag 114 (224-byte stride) %d x %d, %d cols: %.1f us  (%.1f GB/s of the 210-byte weights)  rel diff vs tag 14: %.2e  speedup %.2fx\n",
+                    n_in, n_out, ncols, us2, wbytes / us2 / 1e3, num / (den > 0 ? den : 1), us / us2);
+    }
     return 0;
 }

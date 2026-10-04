@@ -1,5 +1,6 @@
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
+#include <vector>
 #include <dpct/dpct.hpp>
 #include "strata/core/native_dense.hpp"
 #include "strata/core/weights.hpp"
@@ -165,18 +166,27 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
+                const int serving = strata::kernels::native_mmvq_serving_type((int) tensor.type);   // may be a repacked layout
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
-                    tensor.type, (int) ref.ne0, (int) ref.ne1);
+                    serving, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
                 auto status =
                     DPCT_CHECK_ERROR(allocation = (void *)sycl::malloc_device(
                                          bytes, dpct::get_in_order_queue()));
                 DevicePtr data(allocation);
-                if (status == 0)
+                if (status == 0) {
+                    std::vector<uint8_t> packed;
+                    const void* source = gguf.tensor_data(tensor);
+                    if (serving != (int) tensor.type) {
+                        packed.resize(bytes);
+                        strata::kernels::native_mmvq_pack(serving, source, (int) ref.ne0, (int) ref.ne1, packed.data());
+                        source = packed.data();
+                    }
                     status = DPCT_CHECK_ERROR(
                         dpct::get_in_order_queue()
-                            .memcpy(data.get(), gguf.tensor_data(tensor), bytes)
+                            .memcpy(data.get(), source, bytes)
                             .wait());
+                }
                 /*
                 DPCT1000: Error handling if-stmt was detected but could not
                 be rewritten.
@@ -197,7 +207,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
+                pending.push_back(Pending{&ref, serving, bytes, std::move(data)});
             }
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }

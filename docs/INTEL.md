@@ -653,7 +653,7 @@ slow").
 
 The A770 has one compute queue and one copy queue (the B70 has more), 512 EUs, 64 KiB of local memory per work-group.
 
-**Speed.** Decode is 9.75 tok/s GPU-only and 8.0-8.7 on the host-plan path (llama.cpp's SYCL backend, same GGUF, same card:
+**Speed.** Decode is 10.4 tok/s GPU-only and 8.0-8.7 on the host-plan path (llama.cpp's SYCL backend, same GGUF, same card:
 9.4-9.8), prompt reading 11-23 tok/s on a 19-token prompt. 4,836 of the 12,288 experts fit in VRAM; the other 7,452 are mirrored in pinned host memory and read by the
 GPU over PCIe.
 
@@ -754,8 +754,7 @@ GB/s against a measured 426 GB/s streaming ceiling with 16-byte loads). Measured
 | the shared kernel (`STRATA_MMVQ_WIDE=0`) | 62 | 60 | 61 | 63 | 65 |
 | blocks repacked at a 224-byte stride (`q6k_align_bench`) | 186 vs 162 | | 142 vs 102 | 162 vs 101 | 267 vs 135 |
 
-- Nothing existing beats the default. The repacked 224-byte stride is 1.15-1.98x faster at 2 columns (and much slower at 4 or
-  more), worth about 4.5 ms of the 100 ms round, and costs a repack at load and 6.7% more memory for those tensors. Not done.
+- Nothing existing beats the default. **The repacked 224-byte stride is now done** (type tag 114, below).
 - `strata::dp4a` (byte unpack and multiply-add, which the source says IGC turns into the DP4A instruction) runs at 730 G dp4a/s
   in a microbenchmark against 2,654 G/s for `__builtin_IB_dp4a_ss`; but the microbenchmark is not a clean isolation (see below),
   and swapping the builtin into the kernel changed nothing (identical GB/s to the digit in the same build). The Q6_K kernel is
@@ -776,6 +775,18 @@ GB/s against a measured 426 GB/s streaming ceiling with 16-byte loads). Measured
   at least 1.5x faster than the fp16 GEMM on the real shapes) but IGC crashes on the fp16 `joint_matrix` kernels for dg2 and
   nobody has probed int8. The Intel blog post that prompted this (community.intel.com, "Engineering Arc 3/30/2022") could not be
   retrieved (Cloudflare challenge), so its claims are unverified here.
+
+**Q6_K served from a repacked layout (done).** Every Q6_K block is 210 bytes, so its 16-byte loads start at 2-byte-aligned
+addresses and the kernel needs a two-load-and-shift workaround (`load16_a2`). With `STRATA_SYCL_NO_XMX`-style opt-out aside, the
+loaders (`native_dense.cpp`, `native_head.cpp`) now pad each block to 224 bytes on the host before the upload, under a new
+type tag 114 (`native_mmvq_serving_type`, `native_mmvq_pack`; `STRATA_Q6K_STRIDE224=0` keeps the GGUF layout). The decode kernel
+(`native_q6_k_mmvq_s224`, the wide kernel with aligned weight loads and scalar activation loads, at most 4 columns a launch:
+5 and 6 columns in one launch spill registers, 0.14x) and the prefill dequantiser (`dequant_bf16.dp.cpp`) know the tag; any
+other consumer fails loudly on an unknown type instead of misreading. Results are bit-identical to the 210-byte kernel.
+`mmvq_bench` against the old kernel in the same build, 2 columns: 1.20x (2560x10240), 1.26x (2560x6144), 1.32x (6144x2560),
+1.20x (2560x12288), 1.12x (the 248,320-row head), about 1.3x at 4 columns, 0.93x at 1. Whole GPU-only decode, 128 tokens, same
+tokens: **10.37 and 10.36 tok/s against 9.77 and 9.76** (+6.2%); load time unchanged (25-26 s of wall time either way; the
+repack of about 1.9 GB is a fraction of a second); the weights grow from 2,019 to 2,105 MiB.
 
 **Adaptive swaps (fixed).** The default `--adapt-every 4` used to zero the output after the first swap. The swap itself was
 sound: the device residency table matched the host's and the swapped-in slots were byte-identical to the GGUF. An evicted expert

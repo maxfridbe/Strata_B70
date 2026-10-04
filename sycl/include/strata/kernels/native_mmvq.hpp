@@ -109,6 +109,15 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
 // capability query returns false.
 bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
+
+// SYCL port: a tensor can be served from a different layout than the GGUF's. Type tag 114 is Q6_K with every 210-byte block padded
+// to 224 bytes, so each block, and every 16-byte load inside it, is 16-byte aligned (measured on the A770: 1.15-1.98x for the
+// decode mat-vec at 2 columns). `native_mmvq_serving_type` is the tag a GGUF tensor of `ggml_type` is uploaded under
+// (STRATA_Q6K_STRIDE224=0 keeps 14), `native_mmvq_weight_bytes` and every dispatcher take that tag, and `native_mmvq_pack`
+// converts the GGUF's bytes to its layout on the host. Loading is slower, decoding is faster.
+inline constexpr int kNativeQ6KStride224 = 114;
+int native_mmvq_serving_type(int ggml_type);
+void native_mmvq_pack(int serving_type, const void* gguf_bytes, int n_in, int n_out, void* packed);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 
