@@ -14,6 +14,7 @@ RUN { source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true; } \
     && cmake -S /src/sycl -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
          -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
          -DSTRATA_SYCL_AOT=dg2-g10 -DSTRATA_SYCL_NO_XMX=ON -DSTRATA_SYCL_LARGE_BUFFERS=ON -DSTRATA_SYCL_PARITY=OFF \
+         -DSTRATA_GGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_AVX512=OFF \
     && cmake --build /build --target strata -j "$(nproc)"
 
 FROM ${BASE}
