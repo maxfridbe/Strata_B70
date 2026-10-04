@@ -3568,6 +3568,23 @@ int main(int argc, char **argv) try {
                                  "STRATA_MIRROR_MIB or the free RAM, or lower --max-context\n", (long long) unmirrored_misses);
     }
 
+    const bool verify_no_host = std::getenv("STRATA_VERIFY_NO_HOST") != nullptr;
+    auto swap_victim_eligible = [&](int64_t layer, int64_t expert) {
+        return !verify_no_host || (srcp->pinned(layer, expert) && srcp->device_alias(layer, expert) != nullptr);
+    };
+    if (verify_no_host && o.adapt_every > 0 && o.adapt_swaps > 0) {
+        int64_t mirrored = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e)
+                if (swap_victim_eligible(l, e)) ++mirrored;
+        if (mirrored != g.n_layers * g.n_expert) {
+            std::fprintf(stderr, "strata generate: STRATA_VERIFY_NO_HOST: only %lld of %lld experts have GPU-readable "
+                                 "host mirrors; disabling adaptive swaps to keep evicted experts readable\n",
+                         (long long) mirrored, (long long) (g.n_layers * g.n_expert));
+            o.adapt_swaps = 0;
+        }
+    }
+
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -5512,7 +5529,7 @@ int main(int argc, char **argv) try {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e))) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    else if (swap_victim_eligible(l, e)) vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -7391,7 +7408,7 @@ int main(int argc, char **argv) try {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    else if (swap_victim_eligible(l, e)) vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });

@@ -6,6 +6,7 @@ namespace strata::kernels {
 /// that is not in the VRAM cache but has a non-zero entry in `mirror_table` ([n_layers][n_expert] device-readable
 /// addresses, 0 = none) as planned: the expert kernels read it from that address, over PCIe. `d_res` is the residency
 /// table whose per-layer slices resident_plan receives, so the layer of a call is found from its pointer.
+/// Adaptive swaps without host assistance must retain a mirror for every evicted expert.
 void resident_plan_set_mirror(const int32_t* d_res, const unsigned long long* mirror_table);
 /// From now on (and in every graph captured after this call) resident_plan counts, in `usage_table`
 /// ([n_layers][n_expert] device uint32 counters, indexed like the residency table), how often each expert is routed to.

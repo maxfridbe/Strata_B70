@@ -1154,7 +1154,7 @@ void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_
     check("resident_plan");
 }
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {
-    uint32_t* const timeouts = strata::wait_timeouts_counter(*strata::q_of(stream)) + strata::wait_kind(flag);
+    uint32_t* const timeouts = strata::wait_timeout_registry().counter(flag);
     const uint32_t spin_max = strata::spin_max();
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
@@ -1213,7 +1213,7 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
-    uint32_t* const timeouts = strata::wait_timeouts_counter(*strata::q_of(stream)) + strata::wait_kind(flag);
+    uint32_t* const timeouts = strata::wait_timeout_registry().counter(flag);
     const uint32_t spin_max = strata::spin_max();
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
