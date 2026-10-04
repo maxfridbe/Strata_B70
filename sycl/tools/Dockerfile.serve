@@ -1,4 +1,5 @@
 # Strata SYCL port - serving image for an Intel Arc A770 (dg2-g10, ahead-of-time compiled).
+# Fork deployment; override the base with --build-arg BASE=<image>.
 # Build from the repo root:  docker build -f sycl/tools/Dockerfile.serve -t strata-sycl .
 # The model, its pack and the expert profile stay outside the image (mounted at run time, docs/INTEL.md).
 ARG BASE=ghcr.io/snailium/llama.cpp-sycl-intel-b70/llama-sycl-b70:stable
@@ -34,4 +35,5 @@ ENV PATH=/opt/venv/bin:$PATH \
     ONEAPI_DEVICE_SELECTOR=level_zero:0 SYCL_CACHE_PERSISTENT=0 ZES_ENABLE_SYSMAN=1 \
     IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1 UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 \
     STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1
+ENV STRATA_Q6K_REPACK=1
 ENTRYPOINT ["python", "sycl/serve/server_intel.py"]

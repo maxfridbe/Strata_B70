@@ -1,3 +1,4 @@
+# Fork-only image publishing; manual runs select the deployment tag.
 name: sycl-image
 
 on:
@@ -5,6 +6,12 @@ on:
     branches: [a770-dg2]
     paths: ["sycl/**", "src/**", "include/**", "serve/**", "tools/**", "data/**", ".github/workflows/sycl-image.yml"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Deployment image tag (the commit SHA is also published)
+        type: string
+        required: true
+        default: a770-dg2
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/strata-sycl
@@ -36,4 +43,4 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ env.IMAGE }}:a770-dg2
+            ${{ env.IMAGE }}:${{ inputs.tag || 'a770-dg2' }}

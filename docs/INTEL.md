@@ -1,5 +1,9 @@
 # Strata on an Intel Arc
 
+Image publishing (`.github/workflows/sycl-image.yml` and `sycl/tools/Dockerfile.serve`) is fork-only and is not part of any upstream PR.
+The workflow publishes under the repository owner; manual runs accept a `tag` (default `a770-dg2`) and also publish the commit SHA.
+The serving Dockerfile accepts `--build-arg BASE=<image>` to replace its fork-specific base image.
+
 Strata's engine is CUDA. On an Intel Arc it runs as **Strata's own engine, ported to SYCL** (`sycl/`, the
 section "The engine itself on Intel" below). It sits behind the same Strata server, so the OpenAI and Anthropic
 APIs, streaming, tool calls, MCP and the web app are all unchanged. llama.cpp's SYCL backend is the comparison
@@ -140,7 +144,8 @@ no backend seam to slot into.
      - helper headers renamed since dpct 2025.3 (`entangle`, `chunked_partition`);
      - graph introspection and `cudaGraphUpload`, which have no SYCL equivalents;
      - `%globaltimer` (the stage profiler reads zeros).
-4. **`sycl/tools/build.sh`:** configure and build with icpx inside the image. Two compiler flags are load-bearing:
+4. **`sycl/tools/build.sh`:** configure and build with icpx inside the image. It defaults to `$REPO/build-sycl-aot`;
+   `BUILD_DIR` overrides the directory and `AOT` selects the target when configuring a new build. Two compiler flags are load-bearing:
    - `-fp-model=precise`: icpx defaults to a fast FP model.
    - `-cl-fp32-correctly-rounded-divide-sqrt` for the device compiler. The Arc's fp32 divide is not correctly
      rounded by default (OpenCL allows 2.5 ulp), and Strata's quantizers are byte-exact against ggml through
@@ -542,7 +547,7 @@ IQ1_M, a 19-token prompt, 128 greedy tokens, 8,192 context. The output matches t
 ```
 cmake -S sycl -B build-sycl-aot -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DSTRATA_SYCL_AOT=dg2-g10 \
       -DSTRATA_SYCL_NO_XMX=ON -DSTRATA_SYCL_LARGE_BUFFERS=ON
-IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1 AOT=dg2-g10 sycl/tools/build.sh strata   # full build ~25-40 min
+IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1 cmake --build build-sycl-aot --target strata   # full build ~25-40 min
 
 UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 ZES_ENABLE_SYSMAN=1 \
 build-sycl-aot/strata --pack <iq pack> --native <shard1> --ple-gguf <shard2> --expert-profile data/expert-profile-coder.bin \
@@ -552,6 +557,11 @@ build-sycl-aot/strata --pack <iq pack> --native <shard1> --ple-gguf <shard2> --e
 This is the host-plan path: the CPU computes part of the experts that miss VRAM beside the GPU (8.0-8.7 tok/s). For a GPU-only
 run add `STRATA_VERIFY_DEVICE_PLAN=1 STRATA_VERIFY_NO_HOST=1`: 9.75 tok/s, the faster of the two (see "Why the GPU-only path was
 slow").
+
+The serving image builds the CPU code with `STRATA_GGML_NATIVE=OFF`, `GGML_AVX2=ON`, `GGML_FMA=ON`,
+`GGML_F16C=ON` and `GGML_AVX512=OFF`. Its x86-64 CPU baseline requires AVX2, FMA and F16C; it is not a generic
+x86-64 image. It enables `STRATA_Q6K_REPACK=1` for the measured A770 speedup below; `docker run -e STRATA_Q6K_REPACK=0`
+restores the unpacked layout.
 
 **What differs from the B70, and what each difference needed.**
 
@@ -587,7 +597,7 @@ GPU over PCIe.
 The three "before the fix" rows were fast when they happened to work because the device plan then never had to wait on the host.
 The measurements after the fix are in the second table below.
 
-A round costs about 140 ms whether it carries one token or four, so the decode is not bound by compute. In eager mode with
+A round costs about 140 ms whether it carries one token or four; this alone does not establish the decode bottleneck. In eager mode with
 `STRATA_VERIFY_PROFILE=1` the 36 GDN layers spend 47 ms in the expert stage (VRAM hits and mirror reads), 17 ms in the first
 hyper-connection read and 14 ms in the second read plus the router, against 0.27 ms per layer all-in on the B70. The card
 reads host memory at 9.4 GB/s from a kernel and 9.4 GB/s by DMA on this host (a 2 GiB copy), so PCIe 3.0 is a ceiling but
@@ -630,9 +640,8 @@ Their settings were swept on the host-plan path, 256 tokens, `--spec 2 --suffix-
 | `--vram-reserve-mib 512` (5,102 slots) | 3.8 | 5,630 | 7.86 |
 | tuned + 5,102 slots | 2.1 | 5,198 | 8.27 |
 
-Nothing beat the default, and the differences are within run-to-run noise (about 0.4 tok/s). More slots or more aggressive swapping
-does not help because a round takes about 100 ms of GPU time whether the CPU computes 2 experts per layer or 4: the limit is now
-the GPU's kernels, not where the experts live.
+No tested setting improved on the default; the differences are within the observed run-to-run variation (about 0.4 tok/s).
+A round took about 100 ms of GPU time with either 2 or 4 CPU experts per layer. These runs do not isolate the remaining bottleneck.
 
 **Why the GPU-only path was slow, found with unitrace.** `unitrace -d` (build it from `intel/pti-gpu`, tools/unitrace, as
 `sycl/tools/Dockerfile.unitrace` does) prints the device time per kernel; the decode rounds are the difference between a short
@@ -669,35 +678,47 @@ GB/s against a measured 426 GB/s streaming ceiling with 16-byte loads). Measured
 | the shared kernel (`STRATA_MMVQ_WIDE=0`) | 62 | 60 | 61 | 63 | 65 |
 | blocks repacked at a 224-byte stride (`q6k_align_bench`) | 186 vs 162 | | 142 vs 102 | 162 vs 101 | 267 vs 135 |
 
-- Nothing existing beats the default. **The repacked 224-byte stride is now done** (type tag 114, below).
-- `strata::dp4a` (byte unpack and multiply-add, which the source says IGC turns into the DP4A instruction) runs at 730 G dp4a/s
-  in a microbenchmark against 2,654 G/s for `__builtin_IB_dp4a_ss`; but the microbenchmark is not a clean isolation (see below),
-  and swapping the builtin into the kernel changed nothing (identical GB/s to the digit in the same build). The Q6_K kernel is
-  not limited by dot-product throughput: going from 1 to 2 columns raises its time 1.6x for the same weight bytes, but a
-  4x faster dp4a does not help, so it is bound by load latency, issue or occupancy. The builtin differs from the emulation only
-  where the int32 accumulator saturates (12 of 4 million random inputs, all near +-2^31).
-- The 14% above is the AOT option that `STRATA_SYCL_LARGE_BUFFERS=ON` adds (stateless addressing for every kernel). Over a whole
-  decode it costs only 1.6% (6.84 vs 6.73 tok/s at a cache under 4 GiB, identical output), because the Q6_K kernel is about a
-  sixth of the round. Splitting the expert cache into arenas under 4 GiB to drop the option is not worth it.
-- An outside review of the dp4a numbers: the microbenchmark (`dp4a.cpp`) lets the emulated form share byte extraction because
-  its operands are correlated and only the sum escapes, and an opaque builtin call blocks that, so 3.6x is not a trustworthy rate;
-  the instruction-level cause of the kernel's ceiling has not been found (the missing measurement is the ISA: count dp4a, sends
-  and spills from `ocloc disasm` for both forms). The Q6_K dequant (`dpct::vectorized_binary<char4>(.., sub_sat)`) has an exact
-  cheaper form (values are 0..63 minus 32, so `((x | 0x80808080) - 0x20202020) ^ 0x80808080`); not tried.
-- The matrix engine (XMX, up to 256 int8 ops per clock per unit, against DP4A on the vector ALUs): not useful for decode here,
-  since nothing in decode is arithmetic-bound, and the fork's own notes record three int8 `joint_matrix` expert variants being
-  1.4-3x slower than dp4a (one hung the GPU). It could matter for the prompt path (dequant to int8 plus an int8 GEMM, if int8 is
-  at least 1.5x faster than the fp16 GEMM on the real shapes) but IGC crashes on the fp16 `joint_matrix` kernels for dg2 and
-  nobody has probed int8. The Intel blog post that prompted this (community.intel.com, "Engineering Arc 3/30/2022") could not be
-  retrieved (Cloudflare challenge), so its claims are unverified here.
+- The repacked 224-byte stride is available as an opt-in (type tag 114, below). The other variants in this table did not
+  improve on the aligned-load kernel in these runs.
+- `dp4a.cpp` reported 730 G dp4a/s for `strata::dp4a` and 2,654 G/s for `__builtin_IB_dp4a_ss`. This is not an isolated
+  instruction-throughput measurement: correlated operands let the emulated form share byte extraction, only the sum escapes,
+  and the opaque builtin changes compiler optimisation. Swapping the builtin into Q6_K gave the same reported GB/s in that
+  build. Going from 1 to 2 columns raised kernel time 1.6x for the same weight bytes. Neither observation establishes whether
+  dp4a throughput limits this kernel. Load latency, instruction issue and occupancy remain hypotheses; ISA inspection
+  (`ocloc disasm`, including dp4a instructions, sends and spills) and controlled measurements are still missing.
+  A random-input comparison found 12 differences in 4 million inputs near int32 accumulator overflow; it does not establish
+  equivalence for all inputs.
+- The large-buffer AOT option reduced throughput in the table. A whole-decode comparison with a cache under 4 GiB measured
+  6.84 vs 6.73 tok/s (1.6%, same output tokens). That single comparison does not establish the value of splitting the cache
+  into smaller arenas to avoid the option.
+- XMX's value for decode is unresolved. Earlier fork notes reported int8 `joint_matrix` expert variants 1.4-3x slower than
+  dp4a and one GPU hang, but no reproducible configuration is recorded here, so those reports cannot establish a general
+  limit. On DG2, the fp16 `joint_matrix` kernels and `xmx_int8_bench` fail during IGC compilation with a floating point
+  exception. That prevents a comparison on this A770 build; it is not evidence that XMX cannot help decode or prefill.
 
-**Q6_K served from a repacked layout (done).** Every Q6_K block is 210 bytes, so its 16-byte loads start at 2-byte-aligned
-addresses and the kernel needs a two-load-and-shift workaround (`load16_a2`). The loaders
-(`native_dense.cpp`, `native_head.cpp`) now pad each block to 224 bytes on the host before the upload, under a new
-type tag 114 (`native_mmvq_serving_type`, `native_mmvq_pack`; `STRATA_Q6K_STRIDE224=0` keeps the GGUF layout). The decode kernel
-(`native_q6_k_mmvq_s224`, the wide kernel with aligned weight loads and scalar activation loads, at most 4 columns a launch:
-5 and 6 columns in one launch spill registers, 0.14x) and the prefill dequantiser (`dequant_bf16.dp.cpp`) know the tag; any
-other consumer fails loudly on an unknown type instead of misreading. Results are bit-identical to the 210-byte kernel.
+**Q6_K served from a repacked layout (opt-in).** Q6_K blocks occupy 210 bytes. Set `STRATA_Q6K_REPACK=1` before loading
+weights to pad them to 224 bytes (6.7% more Q6_K storage) for aligned weight loads. The switch is read once in
+`native_mmvq_serving_type`; `native_dense.cpp` and `native_head.cpp` use that decision for allocation and packing.
+Unset, `0`, or any value other than `1` keeps tag 14 and its existing `STRATA_MMVQ_WIDE` selection. The old
+`STRATA_Q6K_STRIDE224` switch is replaced by this opt-in. The serving image enables it explicitly.
+
+The repacked tag 114 uses `native_q6_k_mmvq_s224`, bypassing tag 14's wide-kernel selection. It launches at most 4 columns
+at a time; the original single-launch 5/6-column experiment measured 0.14x. The prefill dequantiser (`dequant_bf16.dp.cpp`)
+also accepts tag 114. `mmvq_bench --selftest` now checks tag 114 against unpacked tag 14 with wide mode both off and on,
+using per-output tolerance `abs(candidate - reference) <= 1e-3 + 1e-5 * abs(reference)`. Non-finite results or mismatches
+return a non-zero exit status. The fixed cases cover columns 1-6, 17 output rows and 1, 3, 4, 5 and 10 blocks per row,
+with deterministic synthetic weights and finite scales. FP32, BF16 and FP16 prefill dequantisation are compared for exact
+finite values at row offsets 0 and 2. This checks layout parity, not agreement with an independent mathematical oracle.
+The expanded checks have not yet been run on a GPU; the earlier benchmark only printed differences and did not enforce
+parity, so it did not establish bit-identical results. With `STRATA_SYCL_PARITY=ON`, run:
+
+```sh
+cmake --build build-sycl-aot --target mmvq_bench
+ctest --test-dir build-sycl-aot -R '^q6k_repack_parity$' --output-on-failure
+```
+
+Normal benchmark invocations also run the fixed parity cases before checking and timing the requested shape.
+Historical A770 timing measurements (not rerun with the expanded checks):
 `mmvq_bench` against the old kernel in the same build, 2 columns: 1.20x (2560x10240), 1.26x (2560x6144), 1.32x (6144x2560),
 1.20x (2560x12288), 1.12x (the 248,320-row head), about 1.3x at 4 columns, 0.93x at 1. Whole GPU-only decode, 128 tokens, same
 tokens: **10.37 and 10.36 tok/s against 9.77 and 9.76** (+6.2%); load time unchanged (25-26 s of wall time either way; the
@@ -723,8 +744,8 @@ decode is 8.0-8.6 against 7.3-7.5. It costs about 9 GiB more pinned memory on th
 `GgufExpertSource::blob()` published a ring slot before its read had finished; that race is fixed too but was not the cause.
 
 **Re-checked on engine 0.1.38-sycl (2026-10-04),** after merging upstream's b70 up to 25277f9 into this branch: GPU-only decode 10.37 and
-10.36 tok/s (128 tokens, the same tokens as before), host plan 8.66; the kernel parity results are unchanged (the same tests
-pass and the same five do not); `STRATA_GR_DOWN_MAX4=1` makes no difference here. `xmx_int8_bench`, upstream's int8 DPAS
+10.36 tok/s (128 tokens, the same tokens as before), host plan 8.66; the previously reported test failures remain unresolved
+(listed below); `STRATA_GR_DOWN_MAX4=1` makes no difference here. `xmx_int8_bench`, upstream's int8 DPAS
 prototype, makes IGC for dg2 die with a floating point exception, like the fp16 `joint_matrix` kernels, so it is built only
 without `STRATA_SYCL_NO_XMX`; upstream measured it 0.38-0.98x of dequant + oneMKL on the B70 and not worth an engine port.
 
@@ -758,3 +779,8 @@ which is why pp512 at depth 0 is below the steady 132 tok/s of the longer prompt
 - Per-kernel timestamps read zeros (`%globaltimer`), so the profile above is host-timed and per stage.
 - The prompt path needs `iq_dequant_f16` and the oneMKL GEMMs; `conversation_snapshot_test` segfaults (not investigated).
 - `kv_hybrid_parity` and `qsa_prompt_attn_parity` fail with `STRATA_SYCL_NO_XMX=ON` because they require the XMX kernel.
+- `s2_expert_grouped_parity` fails on the unused s2 path. The earlier claim of five failing tests did not identify a fifth;
+  a complete named A770 test log is still needed.
+- DG2 IGC compilation crashes on `xmx_gemm_iq`, `qsa_prompt_attn_xmx` and `xmx_int8_bench`; these paths are excluded by
+  `STRATA_SYCL_NO_XMX=ON`, not validated by it.
+- The expanded `q6k_repack_parity` checks above await a GPU run.
