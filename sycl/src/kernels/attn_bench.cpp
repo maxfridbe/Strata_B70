@@ -4,8 +4,10 @@
 //   attn_bench [reps=20] [context cells=131072] [variants...]
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/experimental/group_load_store.hpp>
 #include <dpct/dpct.hpp>
 #include <algorithm>
 #include <cfloat>
@@ -80,7 +82,7 @@ void chunk_kernel(sycl::nd_item<1> it, const float* q, Pools p, const int32_t* i
 #pragma unroll
             for (int h = 0; h < HH; ++h) sp[(hb + h) * CH + c] = acc_s[h] * scale;
         }
-    } else if constexpr (VAR == 4 || VAR == 6 || VAR == 7 || VAR == 8 || VAR == 9 || VAR == 10 || VAR == 11 || VAR == 12 || VAR == 13) {
+    } else if constexpr (VAR == 4 || VAR == 6 || VAR == 7 || VAR == 8 || VAR == 9 || VAR == 10 || VAR == 11 || VAR == 12 || VAR == 13 || VAR == 15 || VAR == 16 || VAR == 17 || VAR == 18 || VAR == 19 || VAR == 20) {
         for (int c = t; c < CH; c += T) {
             if (c >= n_here || srow[c] < 0) {
                 for (int h = 0; h < G; ++h) sp[h * CH + c] = -FLT_MAX;
@@ -236,6 +238,169 @@ void chunk_kernel(sycl::nd_item<1> it, const float* q, Pools p, const int32_t* i
         for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
         return;
     }
+    if constexpr (VAR == 16) {
+        // values: per-cell V row pointers and scales in local memory once; 4 cells' loads issued together
+        const int8_t** vrow = reinterpret_cast<const int8_t**>(sk);          // [CH] pointers (nullptr: masked)
+        float* vsc = sk + 2 * CH;                                            // [CH][4] scales
+        for (int c = t; c < CH; c += T) {
+            const long long r = c < n_here ? srow[c] : -1;
+            vrow[c] = r >= 0 ? p.vq + r * HD : nullptr;
+#pragma unroll
+            for (int g = 0; g < 4; ++g) vsc[c * 4 + g] = r >= 0 ? h2f(p.vs[r * (HD / k::KV_Q8_GROUP) + g]) : 0.0f;
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        float acc[G];
+#pragma unroll
+        for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+        const int g4 = t / k::KV_Q8_GROUP;
+        int c = 0;
+        for (; c + 4 <= n_here; c += 4) {
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int8_t* rp = vrow[c + j];
+                v[j] = rp ? (float) rp[t] * vsc[(c + j) * 4 + g4] : 0.0f;
+            }
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const sycl::float4 w = *reinterpret_cast<const sycl::float4*>(&sp[h * CH + c]);
+                acc[h] = sycl::fma(w.x(), v[0], acc[h]);
+                acc[h] = sycl::fma(w.y(), v[1], acc[h]);
+                acc[h] = sycl::fma(w.z(), v[2], acc[h]);
+                acc[h] = sycl::fma(w.w(), v[3], acc[h]);
+            }
+        }
+        for (; c < n_here; ++c) {
+            const int8_t* rp = vrow[c];
+            if (!rp) continue;
+            const float v = (float) rp[t] * vsc[c * 4 + g4];
+#pragma unroll
+            for (int h = 0; h < G; ++h) acc[h] = sycl::fma(sp[h * CH + c], v, acc[h]);
+        }
+#pragma unroll
+        for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
+        return;
+    }
+    if constexpr (VAR == 19) {
+        // values on XMX: P (12 heads + 4 zero rows, fp16) x V (CH cells x 256 dims, fp16, packed pairs of cells) ->
+        // 16 x 256 fp32. Sub-group w (of 16, 16 lanes) owns dims [16w, 16w + 16). sk: [V packed][P16][C tile per sg]
+        namespace jm = sycl::ext::oneapi::experimental::matrix;
+        sycl::half* vp = reinterpret_cast<sycl::half*>(sk);                  // [CH/2][256][2]
+        sycl::half* p16 = vp + (size_t) CH * HD;                              // [16][CH]
+        float* ct = reinterpret_cast<float*>(p16 + 16 * CH);                  // [16 sg][16][16]
+        for (int c = 0; c < CH; c += 2) {                                     // work-item t = dim t, two cells a pair
+            float v0 = 0.0f, v1 = 0.0f;
+            const long long r0 = c < n_here ? srow[c] : -1, r1 = c + 1 < n_here ? srow[c + 1] : -1;
+            if (r0 >= 0) v0 = (float) p.vq[r0 * HD + t] * h2f(p.vs[r0 * (HD / k::KV_Q8_GROUP) + t / k::KV_Q8_GROUP]);
+            if (r1 >= 0) v1 = (float) p.vq[r1 * HD + t] * h2f(p.vs[r1 * (HD / k::KV_Q8_GROUP) + t / k::KV_Q8_GROUP]);
+            vp[(size_t) (c / 2) * (HD * 2) + t * 2] = sycl::half(v0);
+            vp[(size_t) (c / 2) * (HD * 2) + t * 2 + 1] = sycl::half(v1);
+        }
+        for (int i = t; i < 16 * CH; i += T) {
+            const int h = i / CH, c = i % CH;
+            p16[i] = sycl::half(h < G ? sp[h * CH + c] : 0.0f);
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        auto lptr = [](auto* x) { return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(x); };
+        const int n0 = warp * 16;
+        jm::joint_matrix<sycl::sub_group, float, jm::use::accumulator, 16, 16> C;
+        jm::joint_matrix_fill(sg, C, 0.0f);
+        for (int k0 = 0; k0 < CH; k0 += 16) {
+            jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::a, 16, 16, jm::layout::row_major> A;
+            jm::joint_matrix<sycl::sub_group, sycl::half, jm::use::b, 16, 16, jm::layout::ext_intel_packed> B;
+            jm::joint_matrix_load(sg, A, lptr(p16 + k0), CH);
+            jm::joint_matrix_load(sg, B, lptr(vp + (size_t) (k0 / 2) * (HD * 2) + n0 * 2), HD * 2);
+            jm::joint_matrix_mad(sg, C, A, B, C);
+        }
+        float* myc = ct + warp * 256;
+        jm::joint_matrix_store(sg, C, lptr(myc), 16, jm::layout::row_major);
+        sycl::group_barrier(sg);
+        for (int i = lane; i < G * 16; i += SGS) {
+            const int h = i / 16, d = i % 16;
+            part_acc[((size_t) slot * G + h) * HD + n0 + d] = myc[h * 16 + d];
+        }
+        return;
+    }
+    if constexpr (VAR == 17 || VAR == 18) {
+        // values with sub-group block reads: the sub-group's 32 (17) dims of a V row in one read from one address;
+        // 18: 4 dims per work-item (int32 block read), heads split in 4 groups of 3 so 12 sums stay in registers
+        namespace syex = sycl::ext::oneapi::experimental;
+        float* vsc = sk;                                                     // [CH][4] scales
+        for (int i = t; i < CH * 4; i += T) {
+            const int c = i >> 2, g4 = i & 3;
+            const long long r = c < n_here ? srow[c] : -1;
+            vsc[i] = r >= 0 ? h2f(p.vs[r * (HD / k::KV_Q8_GROUP) + g4]) : 0.0f;
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        if constexpr (VAR == 17) {
+            const int base = warp * SGS;                                     // this sub-group's dims [base, base + SGS)
+            float acc[G];
+#pragma unroll
+            for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+            const int g4 = t / k::KV_Q8_GROUP;
+            for (int c = 0; c < n_here; ++c) {
+                const long long r = srow[c];
+                if (r < 0) continue;
+                int8_t v8;
+                syex::group_load(sg, p.vq + r * HD + base, v8);
+                const float v = (float) v8 * vsc[c * 4 + g4];
+#pragma unroll
+                for (int h = 0; h < G; ++h) acc[h] = sycl::fma(sp[h * CH + c], v, acc[h]);
+            }
+#pragma unroll
+            for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + base + lane] = acc[h];
+        } else {
+            // 8 sub-groups: sub-group w covers dims [(w % 2) * 128, +128) as 32 lanes x 4, heads [(w / 2) * 3, +3)
+            const int dbase = (warp & 1) * 128, h0 = (warp >> 1) * 3, d0 = dbase + lane * 4, g4 = d0 / k::KV_Q8_GROUP;
+            float a[3][4];
+#pragma unroll
+            for (int h = 0; h < 3; ++h) for (int j = 0; j < 4; ++j) a[h][j] = 0.0f;
+            for (int c = 0; c < n_here; ++c) {
+                const long long r = srow[c];
+                if (r < 0) continue;
+                int32_t w4;
+                syex::group_load(sg, reinterpret_cast<const int32_t*>(p.vq + r * HD + dbase), w4);
+                const float sc = vsc[c * 4 + g4];
+                float v[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) v[j] = (float) (int8_t) (w4 >> (8 * j)) * sc;
+#pragma unroll
+                for (int h = 0; h < 3; ++h) {
+                    const float w = sp[(h0 + h) * CH + c];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) a[h][j] = sycl::fma(w, v[j], a[h][j]);
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < 3; ++h)
+                *reinterpret_cast<sycl::float4*>(&part_acc[((size_t) slot * G + h0 + h) * HD + d0]) =
+                    sycl::float4(a[h][0], a[h][1], a[h][2], a[h][3]);
+        }
+        return;
+    }
+    if constexpr (VAR == 15) {
+        // values with the V scales of the chunk's cells cached in local memory (sk: [CH][4] floats)
+        for (int i = t; i < CH * 4; i += T) {
+            const int c = i >> 2, g4 = i & 3;
+            const long long r = c < n_here ? srow[c] : -1;
+            sk[i] = r >= 0 ? h2f(p.vs[r * (HD / k::KV_Q8_GROUP) + g4]) : 0.0f;
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        float acc[G];
+#pragma unroll
+        for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+        const int g4 = t / k::KV_Q8_GROUP;
+        for (int c = 0; c < n_here; ++c) {
+            const long long r = srow[c];
+            if (r < 0) continue;
+            const float v = (float) p.vq[r * HD + t] * sk[c * 4 + g4];
+#pragma unroll
+            for (int h = 0; h < G; ++h) acc[h] = sycl::fma(sp[h * CH + c], v, acc[h]);
+        }
+#pragma unroll
+        for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
+        return;
+    }
     if constexpr (VAR == 12) {
         // values (a): work-item t owns dims [4*(t%64), +4) of heads [3*(t/64), +3): one 4-byte V load per cell
         const int dg = t & 63, hg = t >> 6, d0 = dg * 4, h0 = hg * 3;
@@ -341,7 +506,7 @@ void run_variant(sycl::queue& q, const float* dq, Pools p, const int32_t* dids, 
     const float scale = 1.0f / std::sqrt((float) HD);
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sq(G * HD, h), sp(G * CH, h),
-            sk(VAR == 3 ? CH * (HD + 4) : (VAR == 6 || VAR == 7) ? 4 * G * HD : VAR == 13 ? CH * HD : 1, h);
+            sk(VAR == 3 ? CH * (HD + 4) : (VAR == 6 || VAR == 7) ? 4 * G * HD : VAR == 13 ? CH * HD : VAR == 15 ? CH * 4 : VAR == 16 ? CH * 6 : (VAR == 17 || VAR == 18) ? CH * 4 : VAR == 19 ? (CH * HD / 2 + 8 * CH + 16 * 256) : 1, h);
         sycl::local_accessor<long long, 1> srow(CH, h);
         auto body = [=](sycl::nd_item<1> it) {
             chunk_kernel<VAR, CH>(it, dq, p, dids, n_chunks, scale, part_acc, part_m, part_l,
@@ -351,7 +516,7 @@ void run_variant(sycl::queue& q, const float* dq, Pools p, const int32_t* dids, 
                                   sk.get_multi_ptr<sycl::access::decorated::no>().get());
         };
         const sycl::nd_range<1> nr((size_t) NQ * NKV * n_chunks * 256, 256);
-        if constexpr (VAR == 7) h.parallel_for(nr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] { body(it); });
+        if constexpr (VAR == 7 || VAR == 19 || VAR == 20) h.parallel_for(nr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] { body(it); });
         else h.parallel_for(nr, [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] { body(it); });
     });
     // merge: (query, head) x 256 dims
@@ -493,6 +658,19 @@ int main(int argc, char** argv) {
     if (on("vslm_64")) check("per cell + V staged in SLM, 64", time([&] { run_variant<13, 64>(*q, dq, p, dids, scratch, out_v); }), true);
     if (on("vslm_128")) check("per cell + V staged in SLM, 128", time([&] { run_variant<13, 128>(*q, dq, p, dids, scratch, out_v); }), true);
     if (on("split2")) check("two items per cell (6 heads each), 128", time([&] { run_variant<14, 128>(*q, dq, p, dids, scratch, out_v); }), true);
+    if (on("vscale")) check("per cell + V scales in local memory", time([&] { run_variant<15, 128>(*q, dq, p, dids, scratch, out_v); }), true);
+    if (on("vtable")) check("per cell + V pointer table, 4 loads", time([&] { run_variant<16, 128>(*q, dq, p, dids, scratch, out_v); }), true);
+    if (on("blk1")) check("per cell + sub-group block reads (1 B)", time([&] { run_variant<17, 128>(*q, dq, p, dids, scratch, out_v); }), true);
+    if (on("blk4")) check("per cell + block reads (4 B), 3 heads/item", time([&] { run_variant<18, 128>(*q, dq, p, dids, scratch, out_v); }), true);
+    if (on("xmxold")) {   // the tree's XMX prompt attention (opt-in STRATA_PROMPT_ATTN_XMX=1), 32 queries a call
+        setenv("STRATA_PROMPT_ATTN_XMX", "1", 1);
+        bool ok = k::qsa_prompt_attn_batch(dq, pools, dids, dst, SEL, s, out_v, NQ, q);
+        if (!ok) std::printf("  existing XMX kernel refused the call\n");
+        else check("existing XMX prompt attention (v2)", time([&] { k::qsa_prompt_attn_batch(dq, pools, dids, dst, SEL, s, out_v, NQ, q); }), true);
+    }
+    if (on("xv64")) check("per cell + XMX values (fp16), 64", time([&] { run_variant<19, 64>(*q, dq, p, dids, scratch, out_v); }), true);
+    if (on("xv128")) check("per cell + XMX values (fp16), 128", time([&] { run_variant<19, 128>(*q, dq, p, dids, scratch, out_v); }), true);
+    if (on("pc_sg16")) check("thread per cell at sub-group 16, 128", time([&] { run_variant<20, 128>(*q, dq, p, dids, scratch, out_v); }), true);
     if (on("percell256")) check("thread per cell, 256-cell chunks", time([&] { run_variant<4, 256>(*q, dq, p, dids, scratch, out_v); }), true);
     return 0;
 }

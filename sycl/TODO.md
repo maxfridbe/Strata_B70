@@ -44,10 +44,18 @@ At 40K: expert GEMMs 23%, attention 19%, dequant 16%, QSA select 7%, host groupi
       328.6 -> 258.2 s (780 -> 992 tok/s), 128K 138.9 -> 122.9 s, 40K 38.4 -> 37.4 s; IQ2_XS 40K 762 -> 785 tok/s.
       Not bitwise (as the CUDA build's 3xTF32 path): outputs follow the same text and part at a near-tie after 13-93
       tokens, equally coherent. `STRATA_SELECT_GEMM=0`: the old kernel.
-- [ ] **3c. Prompt attention's K/V gather.** The fallback kernel (19% at 40K, ~48 s of a 256K prompt). Each query
-      gathers ~2 MB of scattered K/V per layer and the kernel moves ~130 GB/s of a 608 GB/s card; its score phase
-      spends 60 sub-group shuffles per cell (12 heads x a 5-step tree). Candidate: scores as thread-per-(cell, head)
-      dots over K staged in local memory. Uncertain (gather-bound); the XMX versions lost twice.
+- [x] **3c. Prompt attention: done, 1.5x kernel / ~10% TTFT** (2026-10-04, 15 attempts in `attn_bench`, 32 queries x
+      2,048 cells, INT8 KV, 131K context; the old kernel 0.57 ms):
+      - kept: scores one work-item per cell with the query heads read from local memory, 128-cell chunks: 0.37 ms.
+        Coder TTFT 40K 37.2 -> 33.5 s, 128K 123.0 -> 111.3 s, 256K 258.3 -> 235.1 s. `STRATA_ATTN_PERCELL=0`: old.
+      - measured: the K/V gather alone is 0.07 ms (the selections share cells and stay in cache) - the kernel is
+        arithmetic-bound; the values pass is ~60% of it now, ~0.14 ms of that its V reads.
+      - no gain: SYCL's native sub-group reduction in the engine's order (1.03x), K staged in local memory (0.29x),
+        64 / 256-cell chunks, 4 dims per work-item (spills: 0.56x), float4 weight loads, 4-byte V loads, V staged in
+        local memory (0.54x), V scales in local memory, a V row pointer table, sub-group block reads (0.95x), two
+        work-items per cell (0.91x).
+      - XMX: the tree's v2 kernel 1.68 ms (120 KB of local memory: one work-group per core), a lean fp16 XMX values
+        pass 1.6-2.1 ms; sub-group 16 alone costs only 0.05 ms, so the joint_matrix path itself loses here.
 
 ## Later
 
