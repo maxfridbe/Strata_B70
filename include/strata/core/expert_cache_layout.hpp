@@ -22,6 +22,12 @@ inline void reverse_cache_offsets(std::vector<uint64_t>& off) {
     for (size_t i = 0; i + 1 < off.size(); ++i) off[i] = total - off[i + 1];
 }
 
+// Logical prefix size, also used by the resize API. A reversed prefix is at the high end of the arena.
+inline uint64_t cache_prefix_bytes(int64_t slots, const uint64_t* off, bool reversed, int64_t n) {
+    if (n <= 0) return 0;
+    return reversed ? off[slots] - off[n - 1] : off[n];
+}
+
 inline uint64_t cache_tail_bytes(int64_t slots, uint64_t blob, const uint64_t* off,
                                  bool reversed, int64_t first) {
     if (first >= slots) return 0;
