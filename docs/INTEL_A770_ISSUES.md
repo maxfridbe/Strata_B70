@@ -1,7 +1,7 @@
 # Intel Arc A770: driver, runtime and compiler issues found running Strata
 
 What went wrong on an Arc A770 (Alchemist, DG2-G10, 16 GB) with Intel's compute stack while bringing up the SYCL port, what was
-established about each problem, and what works around it. It is a list of things to report or avoid, not a how-to. Most entries
+established about each problem, and what works around it. It is a list of things to report or avoid, not a how-to; the bring-up story and measurements are in [INTEL_A770.md](INTEL_A770.md). Most entries
 came with a measurement; where one is a report from another contributor or an inference, it says so.
 
 ## Configuration these were seen on
