@@ -11,6 +11,7 @@
 #include <sycl/sycl.hpp>
 #include <thread>
 #include <atomic>
+#include <unordered_set>
 
 namespace strata::core {
 
@@ -107,7 +108,7 @@ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
 }
 
 int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>& pairs, uint64_t cap, int threads,
-                                 std::string& err) {
+                                 std::string& err, bool append) {
     // Level Zero caps one host allocation (about 4 GiB on Arc A-series even with relaxed allocation limits), so the
     // mirror is a list of chunks of whole blobs.
     constexpr uint64_t kMaxChunk = 3ull << 30;
@@ -115,17 +116,31 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
     struct Item { int64_t layer, expert; size_t chunk; uint64_t off; };
     std::vector<Item> take;
     std::vector<uint64_t> chunk_bytes;
+    std::unordered_set<int64_t> seen;
     uint64_t total = 0;
     for (const auto& [l, e] : pairs) {
         if (l < 0 || l >= n_layers_ || e < 0 || e >= n_expert_) continue;
+        if (!seen.insert(l * n_expert_ + e).second) continue;
+        if (append && pinned(l, e)) continue;   // appending: already mirrored
         const uint64_t b = (lay.bytes[(size_t) l] + 255) / 256 * 256;
-        if (total + b > cap) break;
+        if (b > kMaxChunk) {
+            err = "mirror: one expert exceeds the 3 GiB host allocation limit";
+            return -1;
+        }
+        if (b > cap - total) break;
         if (chunk_bytes.empty() || chunk_bytes.back() + b > kMaxChunk) chunk_bytes.push_back(0);
         take.push_back({l, e, chunk_bytes.size() - 1, chunk_bytes.back()});
         chunk_bytes.back() += b;
         total += b;
     }
-    if (take.empty()) return 0;
+    if (take.empty()) {
+        if (!append) {
+            for (uint8_t* chunk : mirror_chunks_) sycl::free(chunk, dpct::get_in_order_queue());
+            mirror_chunks_.clear();
+            mirror_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
+        }
+        return 0;
+    }
     std::vector<uint8_t*> chunks;
     for (size_t c = 0; c < chunk_bytes.size(); ++c) {
         uint8_t* base = nullptr;
@@ -164,13 +179,21 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         err = "mirror: reading an expert from the GGUF failed";
         return -1;
     }
-    for (uint8_t* chunk : mirror_chunks_) sycl::free(chunk, dpct::get_in_order_queue());
-    mirror_chunks_ = std::move(chunks);
-    mirror_bytes_ = total;
-    mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
-    layer_first_.assign((size_t) n_layers_, nullptr);
+    // Publish only after all reads succeed. Appends preserve every earlier allocation and alias.
+    if (!append) {
+        for (uint8_t* chunk : mirror_chunks_) sycl::free(chunk, dpct::get_in_order_queue());
+        mirror_chunks_.clear();
+        mirror_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
+    }
+    const size_t first_chunk = mirror_chunks_.size();
+    mirror_chunks_.insert(mirror_chunks_.end(), chunks.begin(), chunks.end());
+    mirror_bytes_ += total;
+    if (mirror_ptr_.empty()) {
+        mirror_ptr_.assign((size_t) (n_layers_ * n_expert_), nullptr);
+        layer_first_.assign((size_t) n_layers_, nullptr);
+    }
     for (const Item& it : take) {
-        const uint8_t* p = mirror_chunks_[it.chunk] + it.off;
+        const uint8_t* p = mirror_chunks_[first_chunk + it.chunk] + it.off;
         mirror_ptr_[(size_t) (it.layer * n_expert_ + it.expert)] = p;
         if (layer_first_[(size_t) it.layer] == nullptr) layer_first_[(size_t) it.layer] = p;
     }

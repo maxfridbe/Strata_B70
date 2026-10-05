@@ -29,56 +29,56 @@ why things are the way they are; this file holds the numbers. It has three parts
 - "Through the API" rows use the served model with its sampling defaults (temperature 0.6, top_p 0.95, top_k 20,
   repetition penalty 1.05).
 
-## Current numbers (engine 0.1.38-sycl, 2026-10-03)
+## Current numbers (engine 0.1.38-sycl, 2026-10-04)
 
-### Benchy v1 on our B70 (the served configs, 2026-10-03)
+### Benchy v1 on our B70 (the served configs, 2026-10-04)
 
 `sycl/benchy.sh`, unchanged ("Submitting numbers" below): each model with the serve config it is actually served
 with, from a cold page cache. Its report, as written:
 
 | Model / configuration | Input tokens | PP (tok/s) | TTFT (s) | TG (tok/s) | Drafts accepted | Actual output tokens | Completed requests |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| coder-iq1_m, 256K context | 20 | 13.44 | 1.7 | 76.40 | 74% | 256 | 1/1 |
-| coder-iq1_m, 256K context | 2,185 | 478.60 | 4.9 | 73.56 | 73% | 256 | 1/1 |
-| coder-iq1_m, 256K context | 8,000 | 818.88 | 10.1 | 71.18 | 73% | 256 | 1/1 |
-| coder-iq1_m, 256K context | 40,000 | 1,006.09 | 40.1 | 65.30 | 70% | 256 | 1/1 |
-| coder-iq1_m, 256K context | 128,000 | 910.09 | 140.9 | 62.61 | 74% | 256 | 1/1 |
-| coder-iq1_m, 256K context | 256,000 | 779.43 | 328.8 | 54.29 | 68% | 256 | 1/1 |
-| iq2_xs, 128K context | 20 | 11.12 | 2.0 | 53.39 | 75% | 256 | 1/1 |
-| iq2_xs, 128K context | 2,185 | 297.12 | 7.7 | 63.51 | 78% | 256 | 1/1 |
-| iq2_xs, 128K context | 8,000 | 566.28 | 14.4 | 64.37 | 79% | 256 | 1/1 |
-| iq2_xs, 128K context | 40,000 | 706.51 | 56.9 | 59.38 | 70% | 256 | 1/1 |
-| iq2_xs, 128K context | 128,000 | 670.67 | 191.2 | 56.88 | 77% | 256 | 1/1 |
-| swift-iq2_xs, 128K context | 20 | 11.09 | 2.0 | 52.29 | 74% | 256 | 1/1 |
-| swift-iq2_xs, 128K context | 2,185 | 301.63 | 7.5 | 62.01 | 69% | 256 | 1/1 |
-| swift-iq2_xs, 128K context | 8,000 | 572.62 | 14.3 | 64.47 | 77% | 256 | 1/1 |
-| swift-iq2_xs, 128K context | 40,000 | 706.44 | 56.9 | 52.50 | 66% | 256 | 1/1 |
-| swift-iq2_xs, 128K context | 128,000 | 668.57 | 191.7 | 56.23 | 69% | 256 | 1/1 |
+| coder-iq1_m, 256K context | 20 | 35.31 | 0.8 | 75.40 | 73% | 256 | 1/1 |
+| coder-iq1_m, 256K context | 2,185 | 501.60 | 4.6 | 73.02 | 72% | 256 | 1/1 |
+| coder-iq1_m, 256K context | 8,000 | 1,008.95 | 8.2 | 70.21 | 71% | 256 | 1/1 |
+| coder-iq1_m, 256K context | 40,000 | 1,200.93 | 33.6 | 65.69 | 68% | 256 | 1/1 |
+| coder-iq1_m, 256K context | 128,000 | 1,154.03 | 111.2 | 61.42 | 69% | 256 | 1/1 |
+| coder-iq1_m, 256K context | 256,000 | 1,090.64 | 235.1 | 54.12 | 69% | 256 | 1/1 |
+| iq2_xs, 128K context | 20 | 35.13 | 0.8 | 52.53 | 65% | 256 | 1/1 |
+| iq2_xs, 128K context | 2,185 | 451.20 | 5.1 | 64.30 | 76% | 256 | 1/1 |
+| iq2_xs, 128K context | 8,000 | 738.15 | 11.1 | 65.09 | 79% | 256 | 1/1 |
+| iq2_xs, 128K context | 40,000 | 838.48 | 48.0 | 59.82 | 71% | 256 | 1/1 |
+| iq2_xs, 128K context | 128,000 | 824.99 | 155.5 | 54.77 | 67% | 256 | 1/1 |
+| swift-iq2_xs, 128K context | 20 | 23.20 | 1.1 | 51.90 | 82% | 256 | 1/1 |
+| swift-iq2_xs, 128K context | 2,185 | 482.64 | 4.8 | 64.56 | 78% | 256 | 1/1 |
+| swift-iq2_xs, 128K context | 8,000 | 731.65 | 11.2 | 62.86 | 73% | 256 | 1/1 |
+| swift-iq2_xs, 128K context | 40,000 | 834.75 | 48.2 | 50.09 | 65% | 256 | 1/1 |
+| swift-iq2_xs, 128K context | 128,000 | 817.21 | 156.9 | 59.33 | 75% | 256 | 1/1 |
 
 | Model / configuration | Input tokens | Experts in VRAM | Offloaded to the RAM mirror | Slots lent to the prompt | Peak VRAM (GB) | RAM (GB) | SSD read at load (GB) | SSD read, request (GB) | PLE rows from SSD (MB) | Load (s) | Avg power (W) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| coder-iq1_m | 20 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 294 | 29.6 | 6.1 | 30.7 | 0.18 | 18 | 38 | 167 |
-| coder-iq1_m | 2,185 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 808 | 29.6 | 6.1 | 30.8 | 0.86 | 125 | 39 | 181 |
-| coder-iq1_m | 8,000 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 1,186 | 29.6 | 6.1 | 30.5 | 1.63 | 122 | 37 | 185 |
-| coder-iq1_m | 40,000 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 1,186 | 29.6 | 6.2 | 30.5 | 1.65 | 123 | 37 | 212 |
-| coder-iq1_m | 128,000 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 1,186 | 29.7 | 6.1 | 30.5 | 1.66 | 122 | 37 | 218 |
-| coder-iq1_m | 256,000 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 1,186 | 29.7 | 6.2 | 30.6 | 1.59 | 122 | 39 | 226 |
-| iq2_xs | 20 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 291 | 30.1 | 11.9 | 42.9 | 0.46 | 17 | 48 | 143 |
-| iq2_xs | 2,185 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 880 | 30.1 | 12.2 | 42.8 | 1.41 | 126 | 47 | 154 |
-| iq2_xs | 8,000 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 1,400 | 30.1 | 12.3 | 42.8 | 2.23 | 120 | 47 | 161 |
-| iq2_xs | 40,000 | 18,302 (24.6 GiB) | 6,274 (8.4 GiB) | 1,400 | 29.9 | 12.4 | 42.8 | 2.42 | 122 | 46 | 180 |
-| iq2_xs | 128,000 | 18,302 (24.6 GiB) | 6,274 (8.4 GiB) | 1,400 | 30.0 | 12.5 | 42.9 | 2.33 | 120 | 47 | 188 |
-| swift-iq2_xs | 20 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 291 | 30.1 | 12.0 | 42.9 | 0.36 | 18 | 47 | 159 |
-| swift-iq2_xs | 2,185 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 880 | 30.1 | 12.0 | 43.0 | 1.29 | 128 | 48 | 153 |
-| swift-iq2_xs | 8,000 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 1,400 | 30.1 | 12.2 | 43.0 | 2.19 | 121 | 49 | 167 |
-| swift-iq2_xs | 40,000 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 1,400 | 30.1 | 12.2 | 42.8 | 2.38 | 124 | 45 | 178 |
-| swift-iq2_xs | 128,000 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 1,400 | 30.3 | 12.3 | 42.8 | 2.34 | 122 | 45 | 188 |
+| coder-iq1_m | 20 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 311 | 29.6 | 8.2 | 30.8 | 1.61 | 18 | 40 | 144 |
+| coder-iq1_m | 2,185 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 808 | 29.6 | 8.3 | 31.0 | 1.24 | 126 | 40 | 160 |
+| coder-iq1_m | 8,000 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 1,186 | 29.6 | 8.5 | 30.5 | 1.90 | 122 | 41 | 164 |
+| coder-iq1_m | 40,000 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 1,186 | 29.6 | 8.4 | 31.2 | 1.25 | 123 | 40 | 199 |
+| coder-iq1_m | 128,000 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 1,186 | 29.7 | 8.5 | 30.5 | 1.92 | 123 | 39 | 207 |
+| coder-iq1_m | 256,000 | 12,288 (23.4 GiB) | 0 (0.0 GiB) | 1,186 | 29.7 | 8.5 | 30.6 | 1.70 | 122 | 41 | 209 |
+| iq2_xs | 20 | 18,302 (24.6 GiB) | 6,274 (8.4 GiB) | 314 | 29.9 | 14.2 | 42.9 | 2.37 | 21 | 49 | 125 |
+| iq2_xs | 2,185 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 880 | 30.1 | 13.9 | 43.0 | 2.12 | 126 | 49 | 136 |
+| iq2_xs | 8,000 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 1,400 | 30.1 | 14.0 | 42.9 | 2.26 | 120 | 49 | 149 |
+| iq2_xs | 40,000 | 18,302 (24.6 GiB) | 6,274 (8.4 GiB) | 1,400 | 29.9 | 14.2 | 42.9 | 2.43 | 122 | 49 | 170 |
+| iq2_xs | 128,000 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 1,400 | 30.2 | 14.1 | 42.9 | 2.15 | 122 | 51 | 177 |
+| swift-iq2_xs | 20 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 314 | 30.1 | 13.9 | 43.4 | 1.62 | 17 | 48 | 137 |
+| swift-iq2_xs | 2,185 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 880 | 30.1 | 13.9 | 42.8 | 2.36 | 128 | 47 | 134 |
+| swift-iq2_xs | 8,000 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 1,400 | 30.1 | 14.0 | 43.5 | 1.66 | 122 | 48 | 160 |
+| swift-iq2_xs | 40,000 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 1,400 | 30.1 | 14.0 | 42.8 | 2.42 | 123 | 48 | 170 |
+| swift-iq2_xs | 128,000 | 18,487 (24.8 GiB) | 6,089 (8.2 GiB) | 1,400 | 30.2 | 14.0 | 43.5 | 1.70 | 121 | 48 | 178 |
 
 System and build:
 - Intel(R) Arc(TM) Pro B70 Graphics, 32 GB, PCIe Gen3 x8 (card max Gen5 x16).
 - AMD Ryzen 7 1700X Eight-Core Processor (16 threads), 23.4 GiB RAM; models on nvme0n1 (PCIe SSD).
 - Ubuntu 24.04.5 LTS, kernel 7.0.0-31-generic.
-- Engine 0.1.38-sycl, commit `f530f9f`, image `strata-sycl-dev 4c52c3a3d252`, `build-sycl-aot/strata`. Each configuration's engine args: `config-<name>.txt`.
+- Engine 0.1.38-sycl, commit `16e5ae0`, image `strata-sycl-dev 4c52c3a3d252`, `build-sycl-aot/strata`. Each configuration's engine args: `config-<name>.txt`.
 
 Caveats:
 - One run per row, greedy, 256 new tokens, a fresh engine each time; the page cache dropped before every run (cold start).
@@ -92,9 +92,24 @@ The configs (`config-*.txt`):
 - `iq2_xs`: `--pack /work/Strata-data/packs/iq2_xs --native /work/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf --ple-gguf /work/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf --expert-profile /work/Strata_B70/data/expert-profile.bin --expert-cache auto --prefill 4096 --spec 4 --spec-min-p 0.5 --mtp /work/Strata-data/mtp/rt --max-context 131072 --kv int8 --stream-experts --vram-reserve-mib 2048 --kv-resident 32768`
 - `swift-iq2_xs`: `--pack /work/Strata-data/packs/swift-iq2_xs --native /work/models/SWIFT-IQ2_XS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf --ple-gguf /work/models/SWIFT-IQ2_XS/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf --expert-profile /work/Strata_B70/data/expert-profile.bin --expert-cache auto --prefill 4096 --spec 4 --spec-min-p 0.5 --mtp /work/Strata-data/mtp/rt --max-context 131072 --kv int8 --stream-experts --vram-reserve-mib 2048 --kv-resident 32768`
 
-- **Short prompts read slowly here, by design of the configs.** Above 32K context the prompt path borrows cache
-  slots (about a second per prompt), and every run starts cold, so the PLE rows come from the SSD. The 32K test
-  config reads the same 2,185 tokens at 784-799 tok/s (below).
+**Against the same bench on 2026-10-03** (before the lend mirror, the GEMM block scores and the per-cell attention;
+outputs of the first two are the old ones' up to near-ties, see History):
+
+| | 2026-10-03 PP / TTFT | 2026-10-04 PP / TTFT |
+|---|---|---|
+| Coder, 2,185 tokens | 479 tok/s / 4.9 s | 502 tok/s / 4.6 s |
+| Coder, 8,000 | 819 / 10.1 s | 1,009 / 8.2 s |
+| Coder, 40,000 | 1,006 / 40.1 s | 1,201 / 33.6 s |
+| Coder, 128,000 | 910 / 140.9 s | 1,154 / 111.2 s |
+| Coder, 256,000 | 779 / 328.8 s | **1,091 / 235.1 s** |
+| IQ2_XS, 2,185 | 297 / 7.7 s | 451 / 5.1 s |
+| IQ2_XS, 128,000 | 671 / 191.2 s | 825 / 155.5 s |
+| Swift 1.5, 128,000 | 669 / 191.7 s | 817 / 156.9 s |
+
+Decode is unchanged. RAM is ~2 GB higher (the lend mirror) and start-up ~2 s longer.
+
+- **Short prompts on these configs:** above 32K context the prompt path borrows cache slots and refills them after
+  the prompt, and every run starts cold. The 32K test config reads the same 2,185 tokens at 784-799 tok/s (below).
 - **The Swift config's `--ple-gguf`** names shard 1 of its GGUF. Swift's shards split differently from the other two
   models, and the engine finds its per-layer embedding table (320,001,536 rows) in shard 1.
 
@@ -210,6 +225,9 @@ Sampling and the repetition penalty cost nothing measurable.
 | 8,000 tokens (2026-09-30) | 27% | 20% | 14% | host grouping 9%, embeddings + PLE rows 5% |
 | 40K tokens (2026-10-03) | 15.7% | 23.4% | 19.2% | QSA select 6.8%, host grouping 6.5%, DeltaNet recurrence 5.8%, gather 5.7%, hyper-connection reads 4.6%, combine 2.4% |
 
+- **The "host grouping" share is mostly the profiler.** Host timers over a 40K prompt's 528 groupings (2026-10-04): the
+  loops 47 ms, the uploads 24 ms, the profiler's own event fold 2,336 ms. Without `STRATA_PREFILL_TIMING` the grouping
+  costs well under 1%. The rows above predate the 2026-10-04 kernels (QSA select and attention are smaller now).
 - **An 80,000-token prompt** (GPU time, 2026-09-30):
   - expert down GEMM 26.0 s, attention 15.4 s, dequant 12.7 s;
   - QSA block selection 9.3 s (0.2 s at 8K: it scans every block of the context per query);
@@ -379,6 +397,46 @@ Kernel level:
 - **#413, per-key-head DeltaNet:** bit-identical but 8% slower here (727 vs 788 tok/s): opt-in.
 - **`STRATA_GR_DOWN_MAX4=1`:** neutral (793 vs 788 tok/s prompt, 76.2 vs 76.3 decode).
 
+### Prompt-path speedups (2026-10-04)
+
+Each measured by A/B on the served configs (benchy's runner, cold page cache, 256 greedy tokens), the change off
+against on.
+
+**The lend mirror** (the lendable experts in pinned RAM; outputs identical):
+
+| | prompt | prompt reading off -> on | refill after the prompt |
+|---|---:|---|---|
+| Coder | 2,185 | 456 -> 610 tok/s (TTFT 4.74 -> 3.87 s) | 720 -> 258 ms |
+| Coder | 8,000 | 802 -> 946 tok/s | 1,045 -> 379 ms |
+| Coder | 40,000 | 988 -> 1,046 tok/s | 1,043 -> 379 ms |
+| IQ2_XS | 2,185 | 303 -> 500 tok/s | 2,240 -> 202 ms |
+| IQ2_XS | 8,000 | 565 -> 720 tok/s | 1,943 -> 325 ms |
+
+**QSA block scores as oneMKL GEMM tiles:**
+
+| | `sel_scores_bench`, 256 queries | warp kernel | GEMM | relative error vs FP64 |
+|---|---|---:|---:|---|
+| | 10,000 blocks (40K cells) | 2.68 ms | 0.37 ms | 1.0e-7 -> 2.7e-7 |
+| | 32,768 blocks (128K) | 6.78 ms | 0.89 ms | 7.8e-8 -> 3.7e-7 |
+| | 65,536 blocks (256K) | 14.62 ms | 1.74 ms | 1.0e-7 -> 2.5e-7 |
+
+The selections match but for near-ties (one query of 256 differs by 3 cells at 40K). Coder TTFT: 40K 38.4 -> 37.4 s,
+128K 138.9 -> 122.9 s, 256K 328.6 -> 258.2 s; IQ2_XS 40K prompt 762 -> 785 tok/s. The bf16x3 and tf32 compute modes
+were no faster than fp32 here.
+
+**Attention scores one work-item per cell** (`attn_bench`: 32 queries x 2,048 cells, INT8 KV, 131K context):
+
+| variant | time | |
+|---|---:|---|
+| the warp kernel (before) | 0.57 ms | |
+| scores one work-item per cell, 128-cell chunks | **0.37 ms** | kept |
+| the K/V rows fetched, no arithmetic | 0.07 ms | the floor: the kernel is arithmetic-bound |
+
+Coder TTFT: 40K 37.2 -> 33.5 s, 128K 123.0 -> 111.3 s, 256K 258.3 -> 235.1 s. Thirteen other variants are listed in
+sycl/TODO.md (none faster).
+
+**Together, Coder TTFT on its served config:** 40K 38.4 -> 33.5 s, 128K 138.9 -> 111.3 s, 256K 328.6 -> 235.1 s (-28%).
+
 ### XMX experiments (all kept opt-in or not built)
 
 | experiment | result |
@@ -389,6 +447,8 @@ Kernel level:
 | `qsa_prompt_attn_xmx` v2 | 1.4-1.5x faster than v1, still ~2x slower (13.4 vs 5.5 ms per chunk, INT8, 32K) |
 | v2 in the full prompt (`STRATA_PROMPT_ATTN_XMX=1`) | 23-33% slower: 128K int8 666 vs 960 tok/s, k8v4 596 vs 983; 256K k8v4 506 vs 752, int8 536 vs 718 |
 | expert dots on int8 DPAS for decode (three versions) | 1.4x and 2-3x slower than dp4a; the third hung the GPU |
+| prompt attention, the tree's v2 (`attn_bench`, 2026-10-04) | 1.68 ms against 0.37 for the per-cell vector kernel (120 KB of local memory: one work-group per core) |
+| prompt attention, a lean fp16 XMX values pass (`attn_bench`, 2026-10-04) | 1.6-2.1 ms against 0.37 (sub-group 16 alone: 0.42) |
 | int8 DPAS GEMM straight from IQ4_NL (`xmx_int8_bench`, 2026-10-03) | within 0.5% of exact; vs dequant + oneMKL: 0.94-0.98x at 16-32 rows, 0.49-0.73x at 64-128, 0.37-0.55x at 256, 0.25-0.38x at 512 |
 
 - **Grouped prompt attention, never built:** measured on the last chunk of an 80K prompt, 8 consecutive positions

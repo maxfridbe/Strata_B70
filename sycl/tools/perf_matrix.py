@@ -151,8 +151,9 @@ def parse(log):
         "cache_slots": g(r"expert cache (\d+) slots", int),
         "cache_gib": g(r"expert cache \d+ slots, ([\d.]+) GiB"),
         "mirror_experts": g(r"(\d+) of \d+ experts missing from VRAM mirrored", int) or 0,
-        "mirror_gib": g(r"mirrored in pinned host memory \(([\d.]+) GiB") or 0.0,
+        "mirror_gib": g(r"experts missing from VRAM mirrored in pinned host memory \(([\d.]+) GiB") or 0.0,
         "lent_slots": g(r"prompt path borrows (\d+) cache slots", int) or 0,
+        "lend_mirror_s": g(r"lendable slots mirrored in pinned host memory \([\d.]+ GiB, ([\d.]+) s\)") or 0.0,
         "ple_ssd_mb": g(r"SSD reads \(([\d.]+) MB\)"),
         "exit": g(r"ENGINE EXIT (-?\d+)", int),
     }
@@ -199,7 +200,10 @@ def run_one(name, cfg, n, outdir, cold, root, dev, timeout):
     if t_end is None:
         t_end, e_end = time.time(), xe_energy_uj()
     avg_w = (e_end - e_up) / 1e6 / (t_end - t_up) if t_up and t_end > t_up + 1 else None
-    return {"config": name, "prompt": n, "new": NEW, "ctx": ctx, **parse(log),
+    parsed = parse(log)
+    if load_s is not None:   # start-up work the engine does after "session is up" (serve mode: before READY)
+        load_s += parsed["lend_mirror_s"]
+    return {"config": name, "prompt": n, "new": NEW, "ctx": ctx, **parsed,
             "peak_vram_gb": peak_vram / 1024 if (root or peak_vram) else None, "ram_gb": (base_avail - min_avail) / 2**30,
             "avg_power_w": avg_w, "load_s": load_s, "ssd_load_gb": (load_disk or 0) / 1e9,
             "ssd_request_gb": (total_disk - (load_disk or 0)) / 1e9, "wall_s": time.time() - t0,
