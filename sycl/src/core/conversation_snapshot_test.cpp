@@ -7,12 +7,24 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <vector>
 
 using namespace strata::core;
 using namespace strata::kernels;
 
+// SYCL port: a copy with neither end in device memory (pinned USM host <-> pageable host) goes through memcpy on the
+// CPU. Through the queue it runs on the Arc's copy engine, which hung on it (dmesg "Engine reset: engine_class=bcs";
+// repeated, the B70 was declared wedged): conversation_snapshot_test, and the parked KV of a --kv-resident session.
+static bool host_only_copy(void* dst, const void* src) {
+    const sycl::context ctx = dpct::get_in_order_queue().get_context();
+    const auto host = [&](const void* p) {
+        const sycl::usm::alloc t = sycl::get_pointer_type(p, ctx);
+        return t == sycl::usm::alloc::host || t == sycl::usm::alloc::unknown;
+    };
+    return host(dst) && host(src);
+}
 namespace {
 int checks = 0;
 void check(bool ok, const char* label) {
@@ -101,7 +113,8 @@ struct Fixture {
         for (size_t i=0;i<sources.size();++i) {
             std::vector<uint8_t> data(sizes[i]);
             for (size_t j=0;j<data.size();++j) data[j]=(uint8_t)(salt+i*31+j*7+j/257);
-            if (!data.empty()) cuda_check(DPCT_CHECK_ERROR(
+            if (!data.empty() && host_only_copy(sources[i], data.data())) std::memcpy(sources[i], data.data(), data.size());
+            else if (!data.empty()) cuda_check(DPCT_CHECK_ERROR(
                 dpct::get_in_order_queue()
                     .memcpy(sources[i], data.data(), data.size())
                     .wait()));
@@ -111,7 +124,9 @@ struct Fixture {
         for (size_t i=0;i<sources.size();++i) {
             const size_t offset = i == 4 ? size_t(first_dirty/4)*g.idx_key_dim*4
                                          : (sizes[i]/size_t(state.max_cells))*size_t((first_dirty/4)*4);
-            if (sizes[i] > offset)
+            if (sizes[i] > offset && host_only_copy(sources[i], sources[i]))
+                std::memset(static_cast<uint8_t *>(sources[i]) + offset, salt, sizes[i] - offset);
+            else if (sizes[i] > offset)
                 cuda_check(DPCT_CHECK_ERROR(
                     dpct::get_in_order_queue()
                         .memset(static_cast<uint8_t *>(sources[i]) + offset,
@@ -122,7 +137,7 @@ struct Fixture {
     ~Fixture() {
         for (void *p : device)
             DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
-        for (void *p : host) DPCT_CHECK_ERROR(free(p));
+        for (void *p : host) DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));   // SYCL port: dpct wrote free(p) for cudaFreeHost
     }
 };
 bool equal(const ConversationKv& a,const ConversationKv& b) {
@@ -225,6 +240,47 @@ void full_session(int fmt, int mode, int experts) {
         check(conversation_kv_verify(incremental.kv.back(),draft.state,g,70,false,fingerprint,err),"incremental draft authoritative and ring read-back");
         ids.resize(65);
     }
+    {
+        // a layer split's later stage: the same image WITHOUT the draft layer's K/V (draft == nullptr)
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A before stage images");
+        size_t with_draft=0,without=0;
+        check(conversation_snapshot_bytes(view,ss,g,draft.state,with_draft,err) &&
+              conversation_snapshot_bytes(view,ss,g,nullptr,without,err) && without<with_draft,
+              "a stage image's estimate leaves the draft out");
+        SavedConversation stage,stage_b,stage_back;
+        check(conversation_snapshot_save(stage,view,ss,g,nullptr,err),"capture a stage image");
+        check(stage.kv.size()==a.kv.size()-1 && equal(stage.kv[0],a.kv[0]) && stage.live.gdn==a.live.gdn,
+              "a stage image holds the session's own layers, no draft");
+        check(stage.bytes()<a.bytes(),"a stage image is smaller by the draft ring");
+        check(conversation_snapshot_validate(stage,ss,g,nullptr,err),"validate a stage image without a draft");
+        check(!conversation_snapshot_validate(stage,ss,g,draft.state,err),"a stage image is refused where a draft is expected");
+        check(!conversation_snapshot_validate(a,ss,g,nullptr,err),"an image with a draft is refused where none is expected");
+        fill(201);
+        check(conversation_snapshot_save(stage_b,view,ss,g,nullptr,err),"capture another stage state");
+        check(conversation_snapshot_restore(a,ss,g,nullptr,err)==ConversationRestore::invalid,
+              "restoring a draft image as a stage image is refused before any write");
+        check(conversation_snapshot_save(stage_back,view,ss,g,nullptr,err) && stage_back.live.gdn==stage_b.live.gdn &&
+              equal(stage_back.kv[0],stage_b.kv[0]),"the refusal left the stage untouched");
+        check(conversation_snapshot_restore(stage,ss,g,nullptr,err)==ConversationRestore::restored,"restore a stage image");
+        check(conversation_snapshot_save(stage_back,view,ss,g,nullptr,err) && stage_back.live.gdn==stage.live.gdn &&
+              stage_back.live.dead==stage.live.dead && equal(stage_back.kv[0],stage.kv[0]),"stage A/B/A exactness");
+        // its retained K/V: the next park copies only what changed, and equals a full capture
+        ConversationKvReuse reuse{stage.kv,65,65,{}};
+        SavedConversation fresh,incremental;
+        size_t peak=0,reused=0;
+        check(conversation_snapshot_save(fresh,view,ss,g,nullptr,err),"full stage capture reference");
+        check(conversation_snapshot_capture_bytes(reuse,view,ss,g,nullptr,peak,err),"admit an incremental stage capture");
+        check(conversation_snapshot_save(incremental,view,ss,g,nullptr,err,std::move(reuse),&reused),"incremental stage capture");
+        check(reused>0 && incremental.bytes()<=peak && equal(incremental.kv[0],fresh.kv[0]) &&
+              incremental.live.gdn==fresh.live.gdn,"an incremental stage capture reuses pages and equals a full one");
+        SavedConversation split_image=stage;
+        split_image.stage_images.push_back(stage);
+        check(!conversation_snapshot_validate(split_image,ss,g,draft.state,err),
+              "a layer split's image is refused by the whole-session form");
+        ConversationKvReuse wrong{a.kv,65,65,{}};
+        check(!conversation_snapshot_capture_bytes(wrong,view,ss,g,nullptr,peak,err),"a draft image's K/V is not a stage's reuse");
+    }
+    check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A after stage images");
     check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"restore early running checkpoint");
     std::vector<uint8_t> spare(sizes.dead);
     cuda_check(DPCT_CHECK_ERROR(

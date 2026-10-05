@@ -33,6 +33,11 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/prefill/kernels.hpp"
+#include <oneapi/mkl.hpp>   // SYCL port: the QSA block scores as GEMM tiles
+namespace strata::kernels {   // SYCL port: qsa_select.dp.cpp (kept out of upstream's qsa_select.hpp)
+void qsa_block_scores_reduce(const float* S, int64_t ld, int64_t b0, int64_t nb, const float* dead, const float* q_idx,
+                             const int32_t* steps, int64_t nq, int64_t max_blocks, float* scores, void* stream);
+}
 
 #include <algorithm>
 #include <chrono>
@@ -95,6 +100,7 @@ constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
+constexpr int64_t kSelTile = 8192; // SYCL port: blocks per GEMM tile of the QSA block scores (32 MB of [256 * 4, tile])
 // Step 3: from this chunk size on, every non-resident expert of every layer streams in a fixed order through a
 // ring_slots()-slot ring (nearly all 512 are routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
@@ -522,6 +528,7 @@ struct Prefill::Impl {
     std::vector<int32_t> steps_host;
     int32_t* sel_ids = nullptr;
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
+    float* sel_S = nullptr;               // SYCL port: [sel_batch * 4, kSelTile] - the block scores' GEMM tile
     int64_t sel_batch = 256, max_blocks = 0;
     float* attn_scratch = nullptr;
     int64_t attn_batch = 32, cap = 0;
@@ -676,6 +683,7 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
     a.take<float>(T * 128, ok); a.take<float>(T * 512, ok); a.take<float>(T * ZV, ok); a.take<uint16_t>(T * ZV, ok);
     a.take<int32_t>(T * (size_t) cap, ok);
     a.take<float>((size_t) sel_batch * (size_t) max_blocks, ok);
+    a.take<float>((size_t) sel_batch * 4 * (size_t) kSelTile, ok);   // SYCL port: the block scores' GEMM tile (init's sel_S)
     a.take<float>((size_t) attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(cap, s), ok);
     return a.used;
 }
@@ -990,6 +998,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.attn = b.take<float>(T * ZV, ok); m.attn_h = b.take<uint16_t>(T * ZV, ok);
         m.sel_ids = b.take<int32_t>(T * (size_t) m.cap, ok);
         m.sel_scores = b.take<float>((size_t) m.sel_batch * (size_t) m.max_blocks, ok);
+        m.sel_S = b.take<float>((size_t) m.sel_batch * 4 * (size_t) kSelTile, ok);
         m.attn_scratch = b.take<float>((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), ok);
         Alloc c;
         c.base = base; c.cap = region; c.owned = &m.owned;
@@ -1626,6 +1635,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
     int hand_buf = 0;
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     double grp_wait_ms = 0, grp_cpu_ms = 0;   // the per-layer grouping: the drain wait, the host's loops
+    double grp_fold_ms = 0, grp_submit_ms = 0; int64_t grp_n = 0;   // SYCL port: the timer's fold, the uploads' submit
     strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
@@ -1940,7 +1950,8 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                     if (m.pp && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
                     int job = -1;
                     const uint8_t* b = nullptr;
-                    if (gsrc != nullptr) {   // read by the stager's thread when its turn comes (see Stager::Job)
+                    if (gsrc != nullptr && !m.src->pinned(l, e)) {   // read by the stager's thread (see Stager::Job)
+                        // (SYCL port: a pinned one - mirrored in RAM - is DMA'd below like an arena blob)
                         job = (int) js.size();
                         js.push_back({nullptr, (size_t) lay0.blob_bytes(l), nullptr, (int32_t) l, e, gsrc});
                     } else if (m.src->transient(l, e)) {   // CS-T: copied by the source into the stager's buffer
@@ -2113,8 +2124,41 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
         }
         host_setup_ms += ms_since(tsetup);
         bool normed = false;   // F-2: the previous half's write already normed R for this half (grs, xn16)
+        // #579 #613 (opt-in diagnosis, STRATA_PF_STEP_SYNC=1): the compute and copy streams are waited for after each
+        // step named below, a step that took over 250 ms is logged, and a stall's report names the step it is in.
+        // Slower (a sync per step); the bytes are the same.
+        static const bool step_sync = [] { const char* e = std::getenv("STRATA_PF_STEP_SYNC"); return e && e[0] == '1'; }();
+        auto pf_step = [&](const char *what, int64_t layer) {
+            try {
+        if (!step_sync) return;
+            core::progress_at(what, layer, p0);
+            const auto ts = Clock::now();
+            const dpct::err0 a = DPCT_CHECK_ERROR(m.cs->wait()),
+                             b = DPCT_CHECK_ERROR(m.copy->wait());
+            const double ms = ms_since(ts);
+            if (ms > 250.0 || a != 0 || b != 0)
+                std::fprintf(stderr,
+                             "strata pf-step: chunk from token %lld, layer "
+                             "%lld: %s took %.0f ms (%s / %s)\n",
+                             /*
+                             DPCT1009: SYCL reports errors using exceptions
+                             and does not use error codes. Please replace the
+                             "get_error_string_dummy(...)" with a real
+                             error-handling function.
+                             */
+                             (long long)p0, (long long)layer, what, ms,
+                             dpct::get_error_string_dummy(a),
+                             dpct::get_error_string_dummy(b));
+        }
+        catch (sycl::exception const &exc) {
+          std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+                    << ", line:" << __LINE__ << std::endl;
+          std::exit(1);
+        }
+        };
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
+            if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
             if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
@@ -2244,7 +2288,20 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                                                             core::qsa_kv_format(st),
                                                             (p0 + s.page_size - 1) / s.page_size, s, m.cs);
                         pt.mark(kPfQsa, cs);
+                        pf_step("reading the prompt (batched, step sync): the K/V staged from RAM at layer", l);
                     }
+                    // #579 #613 (HIP, opt-in A/B, STRATA_KV_HOST_DMA=1): the append writes the staging pool and the
+                    // resident slots only, and one DMA copies the chunk's blocks from the staging pool to the host copy
+                    // - no kernel writes host memory over PCIe.  The bytes every reader sees are the same (the staged
+                    // first block is complete; past the chunk's last cell nothing is read until a later append writes
+                    // it).  CUDA: never.
+#if defined(STRATA_USE_HIP)
+                    static const bool kv_host_dma = [] { const char* e = std::getenv("STRATA_KV_HOST_DMA"); return e && e[0] == '1'; }();
+#else
+                    constexpr bool kv_host_dma = false;
+#endif
+                    const bool host_by_dma = staged && kv_host_dma;
+                    const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
                     if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
                         strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
                         kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
@@ -2259,12 +2316,17 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                         }
                         if (st.kv_q4)
                             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
-                                                          &st.host, staged ? &m.stage : nullptr);
+                                                          host_w, staged ? &m.stage : nullptr);
                         else
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
-                                      &st.host, staged ? &m.stage : nullptr);
+                                      host_w, staged ? &m.stage : nullptr);
+                        if (host_by_dma)
+                            strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                core::qsa_kv_format(st), p0 / s.page_size,
+                                                                (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     }
+                    if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
                     split_q(m.Qf, m.q, T, m.cs);
                     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
                     rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
@@ -2300,9 +2362,33 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                                                                                 strata::kernels::kStepNBid)] + 1;
                         // the scores on tensor cores (3xTF32: FP32-level, not bitwise); STRATA_SELECT_OLD=1: the warp kernel
                         static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
-                        if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                        // SYCL port: the scores as oneMKL GEMM tiles (pooled keys x the batch's indexer queries) and
+                        // a relu-sum (qsa_select.dp.cpp): 7-8x the warp kernel at 40K-256K, FP32-level like the CUDA
+                        // build's 3xTF32 path. STRATA_SELECT_GEMM=0: the warp kernel.
+                        static const bool sel_gemm = [] { const char* v = std::getenv("STRATA_SELECT_GEMM"); return !v || v[0] != '0'; }();
+                        bool sel_done = false;
+                        if (sel_gemm && !old_sel && m.sel_S != nullptr && s.idx_dim == 128 && s.idx_n_head == 4) {
+                            try {
+                                for (int64_t b0 = 0; b0 < active; b0 += kSelTile) {
+                                    const int64_t nbk = std::min<int64_t>(kSelTile, active - b0);
+                                    oneapi::mkl::blas::column_major::gemm(*m.cs, oneapi::mkl::transpose::trans,
+                                                                          oneapi::mkl::transpose::nontrans, nbk, nb * 4, 128, 1.0f,
+                                                                          st.idx_pooled + b0 * 128, 128, m.q_idx + t0 * 512, 128,
+                                                                          0.0f, m.sel_S, kSelTile);
+                                    strata::kernels::qsa_block_scores_reduce(m.sel_S, kSelTile, b0, nbk, st.idx_dead,
+                                                                             m.q_idx + t0 * 512, steps0, nb, m.max_blocks,
+                                                                             m.sel_scores, m.cs);
+                                }
+                                sel_done = true;
+                            } catch (const std::exception& ex) {
+                                static bool said = false;
+                                if (!said) std::fprintf(stderr, "prefill: the GEMM block scores failed (%s); the warp kernel instead\n", ex.what());
+                                said = true;
+                            }
+                        }
+                        if (!sel_done && (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
                                                                              steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                             m.cs, active))
+                                                                             m.cs, active)))
                             strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
@@ -2587,8 +2673,19 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                         */
                         else m.cs->memcpy(m.ids_host.data(), m.ids,
                                           (size_t)T * K * 4);
+                        // #579: a stall here is the GPU (this layer's attention and router, or the previous layer's
+                        // work), not the host: the watchdog's report says so (only its text changes)
+                        core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
+                                          l, p0);
+                        const auto tg0 = Clock::now();
                         m.cs->wait();
+                        const auto tg1 = Clock::now();
+                        core::progress_at("reading the prompt (batched): layer", l, p0);
                         pt.fold();
+                        const auto tg2 = Clock::now();
+                        grp_wait_ms += std::chrono::duration<double, std::milli>(tg1 - tg0).count();
+                        grp_fold_ms += std::chrono::duration<double, std::milli>(tg2 - tg1).count();
+                        ++grp_n;
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
                             /*
                             DPCT1093: The "pe.dev" device may be not the one
@@ -2649,6 +2746,8 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                             slot_h[(size_t) i] = p;
                             src_h[(size_t) p] = (int32_t) (i / K);
                         }
+                        const auto tg3 = Clock::now();
+                        grp_cpu_ms += std::chrono::duration<double, std::milli>(tg3 - tg2).count();
                         if (grp_mapped) {
                             copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);
                             copy_i32(m.src_dev, m.grp_dev + 2 * m.grp_tk, T * K, m.cs);
@@ -2674,6 +2773,7 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
                             m.cs->memcpy(m.src_dev, m.src_host.data(),
                                          (size_t)T * K * 4);
                         }
+                        grp_submit_ms += std::chrono::duration<double, std::milli>(Clock::now() - tg3).count();
                         // the experts, in id order: resident ones from VRAM, the others through the staging ring
                         std::vector<int32_t> order, order_peer;
                         for (int32_t e = 0; e < m.g->n_expert; ++e)
@@ -3547,6 +3647,9 @@ bool Prefill::run(const int64_t *tokens, int64_t n, int64_t pos0,
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+        std::fprintf(stderr, "strata prefill timing: host grouping x%lld: drain wait %.0f ms, timer fold %.0f ms, loops "
+                             "%.0f ms, uploads submitted %.0f ms\n", (long long) grp_n, grp_wait_ms, grp_fold_ms, grp_cpu_ms,
+                     grp_submit_ms);
         if (pe.on) {
             /*
             DPCT1093: The "pe.dev" device may be not the one intended for

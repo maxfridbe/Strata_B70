@@ -28,6 +28,8 @@ static void layout(const std::vector<uint64_t>& sizes) {
             check(reverse[(size_t) first] == forward.back() - forward[(size_t) first + 1]);
             check(reverse[(size_t) first] + sizes[(size_t) first] == tail);
         }
+        check(cache_prefix_bytes(n, reverse.data(), true, first) == forward[(size_t) first]);
+        check(cache_prefix_bytes(n, forward.data(), false, first) == forward[(size_t) first]);
         check(cache_tail_bytes(n, 0, reverse.data(), true, first) == tail);
         check(cache_tail_bytes(n, 0, forward.data(), false, first) == tail);
         if (tail <= kCacheLoanLimit) {
