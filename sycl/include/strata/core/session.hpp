@@ -376,7 +376,7 @@ struct SessionLoopScratch {
     float* y_miss = nullptr;        ///< pinned host staging for the pool's answer, `parts_bytes` long
     size_t parts_bytes = 0;
     dpct::event_ptr probe = nullptr;
-    strata::kernels::cpu::ThreadAffinity pinned_core{};  ///< the full affinity to restore when valid
+    strata::kernels::cpu::ThreadAffinity pinned_core{};  ///< affinity to restore, or invalid if the host was not pinned
     bool pinned = false;
 
     /// Allocates the buffers and pins the host thread.  Call ONCE, at session setup.

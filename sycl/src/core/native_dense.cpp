@@ -3,6 +3,7 @@
 #include <vector>
 #include <dpct/dpct.hpp>
 #include "strata/core/native_dense.hpp"
+#include <cstdlib>
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -85,9 +86,13 @@ NativeDense::~NativeDense() {
         DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
 }
 
-bool NativeDense::load(const std::vector<std::string> &shards,
-                       WeightTable &table, std::string &err,
+bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
                        bool include_ple_key, int64_t layer_lo, int64_t layer_hi) try {
+    auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
+        if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
+        const long l = std::strtol(name.c_str() + 4, nullptr, 10);
+        return l < layer_lo || l >= layer_hi;
+    };
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
@@ -156,12 +161,7 @@ bool NativeDense::load(const std::vector<std::string> &shards,
                 }
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key)) continue;
-                // Shared header's range arguments (batch stages); the port's explicit trim also applies below.
-                if (layer_hi >= 0 && tensor.name.rfind("blk.", 0) == 0) {
-                    const int64_t l = std::strtoll(tensor.name.c_str() + 4, nullptr, 10);
-                    if (l < layer_lo || l >= layer_hi) continue;
-                }
+                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
                 if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
