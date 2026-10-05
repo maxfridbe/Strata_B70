@@ -1,8 +1,6 @@
 # Strata on an Intel Arc
 
-Optional: `sycl/tools/Dockerfile.serve` builds a serving image (ahead-of-time for an A770, CPU baseline AVX2) and
-`.github/workflows/sycl-image.yml` publishes it under the repository owner on pushes to the `a770-dg2` branch (manual runs take a `tag`).
-`--build-arg BASE=<image>` replaces the Dockerfile's base image. Neither is needed to build or run the port.
+Optional: `sycl/tools/Dockerfile.serve` builds a serving image (ahead-of-time for an A770, CPU baseline AVX2); `--build-arg BASE=<image>` replaces its base image. It is not needed to build or run the port.
 
 Strata's engine is CUDA (and HIP for AMD). On an Intel Arc it runs as **Strata's own engine, ported to SYCL** (`sycl/`, the
 section "The engine itself on Intel" below). It sits behind the same Strata server, so the OpenAI and Anthropic
