@@ -11,8 +11,8 @@ Benchy v1, fixed so that every card runs the same bench:
 - **Sizes:** 20, 2,185, 8,000, 40,000, 128,000 and 256,000 tokens. A size that does not fit the config's
   `--max-context` with the new tokens is skipped and listed.
 - **Each run:** a fresh engine process with the config's args verbatim, plus `--tokens-file`,
-  `--max-new 256 --greedy --stats`, and strata-sycl.sh's environment. The page cache is dropped before each run,
-  so every run is a cold start.
+  `--max-new 256 --greedy --stats`, and strata-sycl.sh's environment with the config's "env" on top. The page
+  cache is dropped before each run, so every run is a cold start.
 - **Configs:** every `strata-*.json` with `"backend": "sycl"` next to the checkout (what `sycl/setup_intel.py`
   writes), except steering variants (`--control-vector*`).
 
@@ -31,8 +31,9 @@ REPO = HERE.parents[1]
 ROOT = Path(os.environ.get("STRATA_SYCL_ROOT", REPO.parent))      # mounted at /work, as in strata-sycl.sh
 IMAGE = os.environ.get("STRATA_SYCL_IMAGE", "strata-sycl-dev")
 BIN = os.environ.get("STRATA_SYCL_BIN", "build-sycl-aot/strata")
-# docker (the strata-sycl-dev image), or distrobox:<name> - a toolbox with oneAPI where ROOT is /work, for hosts
-# such as Fedora Silverblue that keep the toolchain in a container
+# docker or podman (the strata-sycl-dev image; rootless podman runs as the user who ran sudo, with that user's
+# images), or distrobox:<name> - a toolbox with oneAPI where ROOT is /work, for hosts such as Fedora Silverblue that
+# keep the toolchain in a container
 RUNNER = os.environ.get("STRATA_SYCL_RUNNER", "docker")
 BOX = RUNNER.split(":", 1)[1] if RUNNER.startswith("distrobox:") else None
 PROMPTS = REPO / "sycl" / "bench" / VERSION
@@ -119,8 +120,9 @@ def machine(dev, cold, root):
                               capture_output=True, text=True).stdout.strip().splitlines()
         image = f"distrobox {BOX}, {icpx[-1] if icpx else 'oneAPI ?'}"
     else:
-        img = subprocess.run(["docker", "image", "inspect", "-f", "{{.Id}}", IMAGE], capture_output=True, text=True).stdout.strip()
-        image = f"{IMAGE} {img[7:19]}"
+        img = subprocess.run(ctr("image", "inspect", "-f", "{{.Id}}", IMAGE), capture_output=True, text=True).stdout.strip()
+        img = img[7:] if img.startswith("sha256:") else img
+        image = f"{IMAGE} {img[:12]}" + (" (podman)" if RUNNER == "podman" else "")
     return {
         "bench": f"benchy {VERSION}", "date": time.strftime("%Y-%m-%d"),
         "cards": intel_cards(), "cpu": cpu, "threads": os.cpu_count(), "ram_gib": round(meminfo("MemTotal") / 2**30, 1),
@@ -134,9 +136,8 @@ def machine(dev, cold, root):
 # ---------------------------------------------------------------- one run
 
 
-def box_cmd(script):
-    """a command line that runs script in the distrobox, as the user who owns it (benchy runs as root via sudo)"""
-    cmd = ["distrobox", "enter", BOX, "--", "bash", "-c", script]
+def as_user(cmd):
+    """cmd as the user who ran sudo: a rootless container (podman, distrobox) is that user's, not root's"""
     uid = os.environ.get("SUDO_UID")
     if os.geteuid() == 0 and uid:
         user = os.environ.get("SUDO_USER") or uid
@@ -144,15 +145,28 @@ def box_cmd(script):
     return cmd
 
 
-def engine_cmd(args, sel):
+def ctr(*args):
+    return as_user(["podman", *args]) if RUNNER == "podman" else ["docker", *args]
+
+
+def box_cmd(script):
+    """a command line that runs script in the distrobox (benchy runs as root via sudo)"""
+    return as_user(["distrobox", "enter", BOX, "--", "bash", "-c", script])
+
+
+def engine_cmd(args, sel, cfg_env=()):
+    """cfg_env: the config's "env" (engine settings serve/server.py sets for it), after strata-sycl.sh's"""
     run = f"cd /work/{REPO.name} && exec {BIN} " + " ".join(shlex.quote(a) for a in args)
+    env0 = ENV + list(cfg_env)
     if BOX:   # the image's environment: its single-card selector, oneAPI's libraries, the OOM killer's first pick
-        env = ENV + [f"ONEAPI_DEVICE_SELECTOR={sel or 'level_zero:0'}"]
+        env = env0 + [f"ONEAPI_DEVICE_SELECTOR={sel or 'level_zero:0'}"]
         return box_cmd("echo 1000 > /proc/self/oom_score_adj; . /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; export "
                        + " ".join(shlex.quote(e) for e in env) + "; " + run)
-    subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True)
-    return ["docker", "run", "--rm", "--name", CONTAINER, "--device", "/dev/dri", "--oom-score-adj", "1000",
-            "-v", f"{ROOT}:/work"] + sum((["-e", e] for e in ENV), []) + (["-e", f"ONEAPI_DEVICE_SELECTOR={sel}"] if sel else []) + \
+    subprocess.run(ctr("rm", "-f", CONTAINER), capture_output=True)
+    # podman: the data disk may carry no SELinux labels, which a confined container cannot read
+    return ctr("run", "--rm", "--name", CONTAINER, "--device", "/dev/dri", "--oom-score-adj", "1000",
+               *(["--security-opt", "label=disable"] if RUNNER == "podman" else []),
+               "-v", f"{ROOT}:/work") + sum((["-e", e] for e in env0), []) + (["-e", f"ONEAPI_DEVICE_SELECTOR={sel}"] if sel else []) + \
            [IMAGE, run]
 
 
@@ -160,7 +174,7 @@ def kill_engine():
     if BOX:   # the engine is the container's child, not ours
         subprocess.run(["pkill", "-KILL", "-x", Path(BIN).name[:15]] + (["-U", os.environ["SUDO_UID"]] if os.environ.get("SUDO_UID") else []))
     else:
-        subprocess.run(["docker", "kill", CONTAINER], capture_output=True)
+        subprocess.run(ctr("kill", CONTAINER), capture_output=True)
 def prompt_file(n, outdir):
     """the v1 prompt of n tokens, written under the data root so the container sees it"""
     short = (PROMPTS / "short.ids").read_text().strip().split(",")
@@ -216,7 +230,7 @@ def run_one(name, cfg, n, outdir, cold, root, dev, timeout):
         subprocess.run(["sync"]); Path("/proc/sys/vm/drop_caches").write_text("3\n"); time.sleep(2)
     log_path = outdir / f"{name}-{n}.log"
     sel = os.environ.get("ONEAPI_DEVICE_SELECTOR") or ("level_zero:gpu" if "--layer-split" in args0 else None)   # as strata-sycl.sh
-    cmd = engine_cmd(args, sel)
+    cmd = engine_cmd(args, sel, [f"{k}={v}" for k, v in (cfg.get("env") or {}).items()])
     base_avail, base_disk, base_vram = meminfo(), disk_read_bytes(dev), vram_used_mb(root) or 0
     t0 = time.time(); peak_vram = 0.0; min_avail = base_avail
     base_cards = vram_by_card_mb() if root else {}; peak_cards = {}   # which card the engine ran on
