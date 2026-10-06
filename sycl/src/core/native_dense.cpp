@@ -95,9 +95,10 @@ NativeDense::~NativeDense() {
         DPCT_CHECK_ERROR(sycl::free(p, dpct::get_in_order_queue()));
 }
 
-bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
+bool NativeDense::load(const std::vector<std::string> &shards,
+                       WeightTable &table, std::string &err,
                        bool include_ple_key, int64_t layer_lo, int64_t layer_hi) try {
-    auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
+    auto outside = [&](const std::string &name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
         return l < layer_lo || l >= layer_hi;

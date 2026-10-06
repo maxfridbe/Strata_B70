@@ -3,7 +3,7 @@
 set -uo pipefail
 # setvars reads unset variables: under -u that ends the script outside the image (a toolbox with oneAPI)
 set +u; source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true; set -u
-repo=${REPO:-/work/Strata_B70}
+repo=${REPO:-$(git rev-parse --show-toplevel)}
 b=${BUILD_DIR:-$repo/build-sycl}
 [ -f $b/build.ninja ] || cmake -S $repo/sycl -B $b -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
     -DSTRATA_SYCL_AOT="${AOT:-}" 2>&1 | tail -15
